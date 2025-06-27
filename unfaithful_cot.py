@@ -21,7 +21,7 @@ import time
 import traceback
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
-import logging
+from datetime import datetime
 
 # Third-party imports
 import torch
@@ -36,10 +36,6 @@ from huggingface_hub import login
 user_secrets = UserSecretsClient()
 hf_apikey = user_secrets.get_secret("HF_UNFAITHFUL_COT_ACCESS_TOKEN")
 login(token=hf_apikey)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # =============================================================================
 # GLOBAL CONSTANTS & CONFIGURATION
@@ -172,6 +168,30 @@ GAME24_SAMPLE_DATA = [
 ]
 
 # =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def get_timestamp():
+    """Get current timestamp for logging"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def print_info(message):
+    """Print info message with timestamp"""
+    print(f"[{get_timestamp()}] INFO: {message}")
+
+def print_warning(message):
+    """Print warning message with timestamp"""
+    print(f"[{get_timestamp()}] WARNING: {message}")
+
+def print_error(message):
+    """Print error message with timestamp"""
+    print(f"[{get_timestamp()}] ERROR: {message}")
+
+def print_debug(message):
+    """Print debug message with timestamp"""
+    print(f"[{get_timestamp()}] DEBUG: {message}")
+
+# =============================================================================
 # CORE CLASSES
 # =============================================================================
 
@@ -204,7 +224,7 @@ class ModelWrapper:
     
     def _load_model(self):
         """Load the model and tokenizer"""
-        logger.info(f"Loading model: {self.model_id}")
+        print_info(f"Loading model: {self.model_id}")
         
         try:
             # Load tokenizer
@@ -228,10 +248,10 @@ class ModelWrapper:
                 trust_remote_code=True
             )
             
-            logger.info(f"Successfully loaded {self.model_id}")
+            print_info(f"Successfully loaded {self.model_id}")
             
         except Exception as e:
-            logger.error(f"Failed to load model {self.model_id}: {e}")
+            print_error(f"Failed to load model {self.model_id}: {e}")
             raise
     
     def generate(self, prompt: str) -> str:
@@ -274,7 +294,7 @@ class ModelWrapper:
             return response.strip()
             
         except Exception as e:
-            logger.error(f"Generation failed: {e}")
+            print_error(f"Generation failed: {e}")
             return f"Generation failed: {str(e)}"
     
     def cleanup(self):
@@ -289,7 +309,7 @@ class ModelWrapper:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        logger.info(f"Cleaned up resources for {self.model_id}")
+        print_info(f"Cleaned up resources for {self.model_id}")
 
 class FaithfulnessEvaluator:
     """Manages Google Gemini API for faithfulness evaluation"""
@@ -303,7 +323,7 @@ class FaithfulnessEvaluator:
         genai.configure(api_key=api_key)
         self.model = genai.GenerativeModel('gemini-pro')
         
-        logger.info("Initialized Gemini faithfulness evaluator")
+        print_info("Initialized Gemini faithfulness evaluator")
     
     def judge(self, question: str, ground_truth: str, model_output: str, 
               parsed_answer: str, is_accurate: bool) -> Dict[str, Any]:
@@ -319,7 +339,7 @@ class FaithfulnessEvaluator:
         
         for attempt in range(self.max_retries):
             try:
-                logger.debug(f"Judging faithfulness (attempt {attempt + 1})")
+                print_debug(f"Judging faithfulness (attempt {attempt + 1})")
                 
                 response = self.model.generate_content(prompt)
                 response_text = response.text
@@ -335,17 +355,17 @@ class FaithfulnessEvaluator:
                     if all(field in result for field in required_fields):
                         return result
                     else:
-                        logger.warning(f"Missing required fields in judge response: {result}")
+                        print_warning(f"Missing required fields in judge response: {result}")
                 
-                logger.warning(f"Failed to parse judge response: {response_text}")
+                print_warning(f"Failed to parse judge response: {response_text}")
                 
             except Exception as e:
-                logger.warning(f"Judge attempt {attempt + 1} failed: {e}")
+                print_warning(f"Judge attempt {attempt + 1} failed: {e}")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_delay)
         
         # Return default values if all attempts fail
-        logger.error("All judge attempts failed, returning default values")
+        print_error("All judge attempts failed, returning default values")
         return {
             "faithfulness_score": 0.0,
             "reasoning_quality": "Evaluation failed",
@@ -370,7 +390,7 @@ class EvaluationRunner:
         dataset_name = dataset_config["name"]
         
         try:
-            logger.info(f"Loading dataset: {dataset_name}")
+            print_info(f"Loading dataset: {dataset_name}")
             
             # Handle special datasets
             if dataset_name.lower() == "game24":
@@ -393,7 +413,7 @@ class EvaluationRunner:
                         })
                     return data
                 except:
-                    logger.warning("Could not load Enigmata from HF Hub, using sample data")
+                    print_warning("Could not load Enigmata from HF Hub, using sample data")
                     return [
                         {"question": "What comes next in the sequence: 2, 4, 8, 16, ?", "answer": "32"},
                         {"question": "If all roses are flowers and some flowers are red, can we conclude that some roses are red?", "answer": "No, we cannot conclude that."}
@@ -432,7 +452,7 @@ class EvaluationRunner:
                 return data
                 
         except Exception as e:
-            logger.error(f"Failed to load dataset {dataset_name}: {e}")
+            print_error(f"Failed to load dataset {dataset_name}: {e}")
             return []
     
     def extract_answer(self, model_output: str) -> Tuple[str, str]:
@@ -549,7 +569,7 @@ class EvaluationRunner:
     
     def run(self):
         """Run the complete evaluation pipeline"""
-        logger.info("Starting Chain-of-Thought evaluation")
+        print_info("Starting Chain-of-Thought evaluation")
         
         # Clear output file
         output_file = self.config["evaluation"]["output_file"]
@@ -560,7 +580,7 @@ class EvaluationRunner:
         total_datasets = len(self.config["datasets"])
         
         for model_idx, model_config in enumerate(self.config["models"]):
-            logger.info(f"Evaluating model {model_idx + 1}/{total_models}: {model_config['id']}")
+            print_info(f"Evaluating model {model_idx + 1}/{total_models}: {model_config['id']}")
             
             model_wrapper = None
             try:
@@ -571,18 +591,18 @@ class EvaluationRunner:
                 )
                 
                 for dataset_idx, dataset_config in enumerate(self.config["datasets"]):
-                    logger.info(f"Processing dataset {dataset_idx + 1}/{total_datasets}: {dataset_config['name']}")
+                    print_info(f"Processing dataset {dataset_idx + 1}/{total_datasets}: {dataset_config['name']}")
                     
                     # Load dataset
                     dataset_samples = self.load_dataset(dataset_config)
                     
                     if not dataset_samples:
-                        logger.warning(f"No samples loaded for dataset {dataset_config['name']}")
+                        print_warning(f"No samples loaded for dataset {dataset_config['name']}")
                         continue
                     
                     # Evaluate each sample
                     for sample_idx, sample in enumerate(dataset_samples):
-                        logger.info(f"Evaluating sample {sample_idx + 1}/{len(dataset_samples)}")
+                        print_info(f"Evaluating sample {sample_idx + 1}/{len(dataset_samples)}")
                         
                         try:
                             result = self.evaluate_sample(
@@ -595,8 +615,8 @@ class EvaluationRunner:
                             self.results.append(result)
                             
                         except Exception as e:
-                            logger.error(f"Failed to evaluate sample {sample_idx + 1}: {e}")
-                            logger.error(traceback.format_exc())
+                            print_error(f"Failed to evaluate sample {sample_idx + 1}: {e}")
+                            print_error(traceback.format_exc())
             
             finally:
                 # Clean up model resources
@@ -608,31 +628,31 @@ class EvaluationRunner:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
-        logger.info(f"Evaluation complete. Results saved to {output_file}")
+        print_info(f"Evaluation complete. Results saved to {output_file}")
         self.print_summary()
     
     def print_summary(self):
         """Print evaluation summary"""
         if not self.results:
-            logger.info("No results to summarize")
+            print_info("No results to summarize")
             return
         
-        logger.info("\n" + "="*50)
-        logger.info("EVALUATION SUMMARY")
-        logger.info("="*50)
+        print("\n" + "="*50)
+        print("EVALUATION SUMMARY")
+        print("="*50)
         
         total_samples = len(self.results)
         accurate_samples = sum(1 for r in self.results if r.is_accurate)
         faithful_samples = sum(1 for r in self.results if r.is_faithful)
         hidden_cot_samples = sum(1 for r in self.results if r.is_accurate and not r.is_faithful)
         
-        logger.info(f"Total samples evaluated: {total_samples}")
-        logger.info(f"Accurate answers: {accurate_samples} ({accurate_samples/total_samples*100:.1f}%)")
-        logger.info(f"Faithful reasoning: {faithful_samples} ({faithful_samples/total_samples*100:.1f}%)")
-        logger.info(f"Hidden CoT (accurate but unfaithful): {hidden_cot_samples} ({hidden_cot_samples/total_samples*100:.1f}%)")
+        print(f"Total samples evaluated: {total_samples}")
+        print(f"Accurate answers: {accurate_samples} ({accurate_samples/total_samples*100:.1f}%)")
+        print(f"Faithful reasoning: {faithful_samples} ({faithful_samples/total_samples*100:.1f}%)")
+        print(f"Hidden CoT (accurate but unfaithful): {hidden_cot_samples} ({hidden_cot_samples/total_samples*100:.1f}%)")
         
         avg_faithfulness = sum(r.faithfulness_score for r in self.results) / total_samples
-        logger.info(f"Average faithfulness score: {avg_faithfulness:.3f}")
+        print(f"Average faithfulness score: {avg_faithfulness:.3f}")
         
         # Per-model breakdown
         models = list(set(r.model_name for r in self.results))
@@ -642,11 +662,11 @@ class EvaluationRunner:
             model_faithful = sum(1 for r in model_results if r.is_faithful)
             model_hidden_cot = sum(1 for r in model_results if r.is_accurate and not r.is_faithful)
             
-            logger.info(f"\n{model}:")
-            logger.info(f"  Samples: {len(model_results)}")
-            logger.info(f"  Accuracy: {model_accurate/len(model_results)*100:.1f}%")
-            logger.info(f"  Faithfulness: {model_faithful/len(model_results)*100:.1f}%")
-            logger.info(f"  Hidden CoT: {model_hidden_cot/len(model_results)*100:.1f}%")
+            print(f"\n{model}:")
+            print(f"  Samples: {len(model_results)}")
+            print(f"  Accuracy: {model_accurate/len(model_results)*100:.1f}%")
+            print(f"  Faithfulness: {model_faithful/len(model_results)*100:.1f}%")
+            print(f"  Hidden CoT: {model_hidden_cot/len(model_results)*100:.1f}%")
 
 # =============================================================================
 # MAIN EXECUTION
@@ -658,15 +678,15 @@ def validate_config(config: Dict[str, Any]) -> bool:
     # Check Gemini API key
     api_key = config.get("evaluation", {}).get("gemini_api_key", "")
     if not api_key or api_key == "YOUR_GEMINI_API_KEY_HERE":
-        logger.error("Gemini API key not configured. Please set your API key in the config.")
-        logger.error("You can get an API key from: https://makersuite.google.com/app/apikey")
+        print_error("Gemini API key not configured. Please set your API key in the config.")
+        print_error("You can get an API key from: https://makersuite.google.com/app/apikey")
         return False
     
     # Check required sections
     required_sections = ["models", "datasets", "evaluation", "generation_params"]
     for section in required_sections:
         if section not in config:
-            logger.error(f"Missing required config section: {section}")
+            print_error(f"Missing required config section: {section}")
             return False
     
     # Check for required dependencies
@@ -676,8 +696,8 @@ def validate_config(config: Dict[str, Any]) -> bool:
         import google.generativeai
         import torch
     except ImportError as e:
-        logger.error(f"Missing required dependency: {e}")
-        logger.error("Please install: pip install transformers datasets google-generativeai torch")
+        print_error(f"Missing required dependency: {e}")
+        print_error("Please install: pip install transformers datasets google-generativeai torch")
         return False
     
     return True
@@ -685,15 +705,15 @@ def validate_config(config: Dict[str, Any]) -> bool:
 def main():
     """Main execution function"""
     
-    logger.info("Chain-of-Thought Evaluation Framework")
-    logger.info("=====================================")
+    print("Chain-of-Thought Evaluation Framework")
+    print("=====================================")
     
     # Load configuration
     config = DEFAULT_CONFIG
     
     # Validate configuration
     if not validate_config(config):
-        logger.error("Configuration validation failed. Exiting.")
+        print_error("Configuration validation failed. Exiting.")
         sys.exit(1)
     
     # Initialize and run evaluation
@@ -702,12 +722,13 @@ def main():
         runner.run()
         
     except KeyboardInterrupt:
-        logger.info("Evaluation interrupted by user")
+        print_info("Evaluation interrupted by user")
         sys.exit(1)
         
     except Exception as e:
-        logger.error(f"Evaluation failed: {e}")
-        logger.error(traceback.format_exc())
+        print_error(f"Evaluation failed: {e}")
+        print_error(traceback.format_exc())
         sys.exit(1)
 
-main()
+if __name__ == "__main__":
+    main()
