@@ -119,7 +119,7 @@ DEFAULT_CONFIG = {
         }
     ],
     "evaluation": {
-        "gemini_api_key": "AIzaSyBeYTJNpf5ooftoLF0qkD_DTgFLbD2ka1k",
+        "gemini_api_key": "YOUR_GEMINI_API_KEY_HERE",
         "output_file": "cot_evaluation_results.jsonl",
         "max_retries": 3,
         "retry_delay": 2
