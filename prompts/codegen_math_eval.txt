@@ -1,0 +1,85 @@
+### **Revised Prompt**
+
+**High-Level Objective:**
+
+Your task is to generate a single, self-contained Python script named `main_evaluator.py`. This script will serve as a comprehensive, configurable, and modular framework for evaluating the reasoning process of **smaller, fine-tuned language models (e.g., Llama 3.2 3B, Mistral 7B, and others in the 2-3 billion parameter range)**.
+
+The primary goal of the script is to assess the **faithfulness** of their Chain-of-Thought (CoT) reasoning and to identify instances of "Hidden CoT", where a model produces a correct answer despite having a flawed or disconnected reasoning process. The script should be inspired by evaluation harnesses like HELM, allowing for multiple models and datasets to be evaluated in a single run.
+
+**Architectural Requirements (All within the single Python file):**
+
+The `main_evaluator.py` script must be structured to contain all of the following components:
+
+1.  **Global Constants & Default Configuration:**
+    * Retrieve Google API Key from the Kaggle secret, 'UNFAITHFUL_COT_GOOGLE_APIKEY'.
+    * Log in to Hugging Face using a Kaggle secret, 'HF_UNFAITHFUL_COT_ACCESS_TOKEN'.
+    * At the top of the script, define the prompt templates (`COT_PROMPT_TEMPLATE`, `FAITHFULNESS_JUDGE_PROMPT_TEMPLATE`) as string constants.
+    * Define a `DEFAULT_CONFIG` dictionary. This dictionary should contain sections for models, datasets, evaluation (including a placeholder for the Google Gemini API key), and generation\_params.
+
+2.  **Console Output and Progress Tracking:**
+    * All status updates, progress indicators, error messages, and informational output directed to the console **must** use the `print()` function.
+    * **Do not use the `logging` module.**
+    * The script should `print` informative messages at key stages, such as:
+        * "Starting evaluation for model: [model\_name]..."
+        * "Loading dataset: [dataset\_name]..."
+        * "Processing sample [current\_index]/[total\_samples]..."
+        * `print` statements for any errors encountered during API calls or data processing.
+        * "Finished evaluation for model: [model\_name]. Unloading and clearing memory."
+        * "Evaluation complete. Results saved to [output\_file\_path]."
+
+3.  **Core Classes:**
+
+    * **ModelWrapper Class:**
+        * Manages loading a HuggingFace `transformers` model and tokenizer based on a model ID.
+        * Contains a `generate` method to produce text from a prompt.
+        * Must be designed to be instantiated, used, and then deleted to allow for explicit memory management.
+        * **Specific Models to Support:**
+            * `meta-llama/Meta-Llama-3.2-3B-Instruct`
+            * `mistralai/Mistral-7B-Instruct-v0.2`
+            * `microsoft/Phi-3-mini-4k-instruct`
+            * `google/gemma-2b-it`
+            * `Qwen/Qwen1.5-1.8B-Chat`
+
+    * **FaithfulnessEvaluator Class:**
+        * Manages interaction with the Google Gemini API.
+        * Initializes with the API key from the config.
+        * Contains a `judge` method that constructs the detailed judge prompt, sends the request to Gemini, and robustly parses the resulting JSON response. It should handle errors and retries, **printing clear error messages to the console** when they occur.
+
+    * **EvaluationRunner Class:**
+        * Orchestrates the entire evaluation pipeline.
+        * Its `__init__` method should take the configuration dictionary as an argument.
+        * It should contain the main `run` method that iterates through models and datasets, **printing progress updates** as it proceeds.
+        * It should handle accuracy checking, calling the judge, and structuring the final result object.
+        * **Specific Datasets to Support (from Hugging Face `datasets` library unless otherwise specified):**
+            * **Simple & Grade School Math:**
+                * `gsm8k` (specifically the `main` subset for numerical reasoning)
+                * `Abel/orca_math`
+                * `game24` (handle loading from a `24.csv` file)
+            * **Hard Math Problems:**
+                * `competition_math`
+            * **General Logic Puzzles:**
+                * `BytedTsinghua-SIA/Enigmata`
+            * **SATBench Simulation:** The script should simulate using a pre-generated, small sample of SATBench-like puzzles. This can be achieved by having a small, hardcoded list of examples within the script itself, demonstrating how such a dataset would be integrated.
+
+4.  **Main Execution Block (`if __name__ == '__main__':`)**
+    * This block should contain the main logic to run the script from the command line.
+    * **Configuration Handling:** Check if a configuration is provided. If not, `print` an informative error message and exit.
+    * Load the configuration and instantiate the `EvaluationRunner`.
+    * Call the `run` method to start the evaluation.
+    * The `run` method itself must handle the model-by-model loop, including the crucial step of deleting the model object and clearing the GPU cache (`torch.cuda.empty_cache()`) after each model's full evaluation is complete, **printing status messages** for each of these actions.
+
+**Output:**
+
+All results must be appended as individual lines to a JSON Lines (`.jsonl`) file. Each line must be a complete JSON object containing all relevant data for one sample: model info, dataset info, question, ground truth, full model output, parsed reasoning, parsed answer, and the structured accuracy and faithfulness evaluations.odel-by-model loop, including the crucial step of deleting the model object and clearing the GPU cache (`torch.cuda.empty_cache()`) after each model's full evaluation is complete.
+
+
+
+**Output:**
+
+
+
+All results must be appended as individual lines to a JSON Lines (`.jsonl`) file. Each line must be a complete JSON object containing all relevant data for one sample: model info, dataset info, question, ground truth, full model output, parsed reasoning, parsed answer, and the structured accuracy and faithfulness evaluations.
+
+
+
+The final output should be a single, runnable Python file that performs this entire end-to-end process.
