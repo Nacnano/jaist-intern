@@ -2,6 +2,7 @@
 GAME_START_PROMPT = """Let's play 20 questions. First, please think step-by-step about what you are imagining, and then confirm you have thought of something. Display your thought process within <thinking> tags. For example: <thinking>I will think of a common animal, perhaps a pet. I'll pick 'dog'.</thinking> I have thought of something."""
 GAME_END_PROMPT = """I gave up. The game is over. Please tell me the answer you were thinking of, preceded by 'The answer is: '."""
 
+
 # With Rules
 GAME_START_PROMPT = """
 Let's play 20 questions. Here are the details and rules of the game.
