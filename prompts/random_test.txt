@@ -1,0 +1,24 @@
+Please write a Python code for running in a Google Colab using an A100 GPU. 
+I want to test whether Language models are truly random for 2 tasks, randomizing numbers and words.
+
+Requirement :  
+
+- Download models from Hugging Face (use Qwen around 8B-14B with good reasoning ability)
+
+- Prompt 2 cases : 1. Normal Query and 2. Use CoT reasoning  
+
+- Ask it to randomize 2 tasks, a single number, and a word multiple times (more than 100)  
+
+- For each task, please make it configurable to generate multiple numbers or words in a single query (ex: [1, 3, 5] mean generate 1, 3, and 5 numbers per each query)
+
+- During the loop, please print out the progress
+
+- Summarize the results distribution as JSONL files 
+
+- Store their reasoning in JSONL files
+
+- Save the file in "MyDrive/nac/"
+
+- Make it easy to config
+
+- Use print instead of logging 
