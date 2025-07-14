@@ -3,13 +3,17 @@ I want to test whether Language models are truly random for 2 tasks, randomizing
 
 Requirement :  
 
-- Download models from Hugging Face (use Qwen around 8B-14B with good reasoning ability)
+- Models
+    - Download models from Hugging Face (use Qwen around 8B-14B with good reasoning ability)
+    - Use model from Gemini api (Gemini2.5flash) 
 
 - Prompt 2 cases : 1. Normal Query and 2. Use CoT reasoning  
 
 - Ask it to randomize 2 tasks, a single number, and a word multiple times (more than 100)  
 
 - For each task, please make it configurable to generate multiple numbers or words in a single query (ex: [1, 3, 5] mean generate 1, 3, and 5 numbers per each query)
+
+- Please make the output be in formats that is easy to further use
 
 - During the loop, please print out the progress
 
