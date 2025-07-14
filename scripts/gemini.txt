@@ -1,0 +1,15 @@
+curl "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent" \
+  -H 'Content-Type: application/json' \
+  -H 'X-goog-api-key: AIzaSyBeYTJNpf5ooftoLF0qkD_DTgFLbD2ka1k' \
+  -X POST \
+  -d '{
+    "contents": [
+      {
+        "parts": [
+          {
+            "text": "Please generate 5 random numbers between 1 and 10"
+          }
+        ]
+      }
+    ]
+  }'
