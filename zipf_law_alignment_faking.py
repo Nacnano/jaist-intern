@@ -9,18 +9,14 @@ import matplotlib.pyplot as plt
 from collections import Counter
 import seaborn as sns
 from scipy import stats
-import logging
 from urllib.parse import urljoin, urlparse
 from typing import Dict, List, Tuple, Optional
 import warnings
 import os
 from datetime import datetime
 import hashlib
-warnings.filterwarnings('ignore')
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
 
 class AlignmentFakingDataScraper:
     """
@@ -37,8 +33,8 @@ class AlignmentFakingDataScraper:
         self.zipf_results = {}
         
         # Create directories for saving files
-        self.html_dir = "/content/drive/MyDrive/nac/alignment_faking/html"
-        self.results_dir = "/content/drive/MyDrive/nac/alignment_faking"
+        self.html_dir = "/content/drive/MyDrive/nac/alignment_faking_data/html"
+        self.results_dir = "/content/drive/MyDrive/nac/alignment_faking_data"
         
         os.makedirs(self.html_dir, exist_ok=True)
         os.makedirs(self.results_dir, exist_ok=True)
@@ -70,10 +66,10 @@ class AlignmentFakingDataScraper:
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(content)
-            logger.info(f"Saved HTML file: {file_path}")
+            print(f"Saved HTML file: {file_path}")
             return file_path
         except Exception as e:
-            logger.error(f"Failed to save HTML file {file_path}: {e}")
+            print(f"ERROR: Failed to save HTML file {file_path}: {e}")
             return ""
         
     def get_page(self, url: str, retries: int = 3) -> Optional[BeautifulSoup]:
@@ -84,11 +80,11 @@ class AlignmentFakingDataScraper:
                 response.raise_for_status()
                 return BeautifulSoup(response.content, 'html.parser')
             except requests.RequestException as e:
-                logger.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
+                print(f"WARNING: Attempt {attempt + 1} failed for {url}: {e}")
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
                 else:
-                    logger.error(f"Failed to fetch {url} after {retries} attempts")
+                    print(f"ERROR: Failed to fetch {url} after {retries} attempts")
                     return None
 
     def extract_main_links(self) -> List[Dict]:
@@ -119,7 +115,7 @@ class AlignmentFakingDataScraper:
                         'path': href
                     })
         
-        logger.info(f"Found {len(links)} trajectory selector pages")
+        print(f"Found {len(links)} trajectory selector pages")
         return links
 
     def extract_trajectory_files(self, selector_url: str) -> List[Dict]:
@@ -169,7 +165,7 @@ class AlignmentFakingDataScraper:
                                 'metadata': file_info.get('json', {})
                             })
                 except (json.JSONDecodeError, KeyError) as e:
-                    logger.warning(f"Failed to parse dataSource from {selector_url}: {e}")
+                    print(f"WARNING: Failed to parse dataSource from {selector_url}: {e}")
         
         # Fallback: look for direct HTML links
         if not files:
@@ -239,7 +235,7 @@ class AlignmentFakingDataScraper:
         all_trajectories = []
         
         for main_link in main_links:
-            logger.info(f"Processing {main_link['category']}/{main_link['subcategory']}/{main_link['phase']}")
+            print(f"Processing {main_link['category']}/{main_link['subcategory']}/{main_link['phase']}")
             
             # Get trajectory files from this selector page
             trajectory_files = self.extract_trajectory_files(main_link['url'])
@@ -249,7 +245,7 @@ class AlignmentFakingDataScraper:
                 trajectory_files = trajectory_files[:limit_per_category]
             
             for file_info in trajectory_files:
-                logger.info(f"Scraping {file_info['filename']}")
+                print(f"Scraping {file_info['filename']}")
                 
                 content = self.extract_trajectory_content(
                     file_info['url'], 
@@ -274,7 +270,7 @@ class AlignmentFakingDataScraper:
                 time.sleep(0.5)
         
         self.trajectories = all_trajectories
-        logger.info(f"Scraped {len(all_trajectories)} trajectories")
+        print(f"Scraped {len(all_trajectories)} trajectories")
         return all_trajectories
 
 class ZipfLawAnalyzer:
@@ -384,14 +380,14 @@ class AlignmentFakingDetector:
         self.scraper = AlignmentFakingDataScraper()
         self.analyzer = ZipfLawAnalyzer()
         self.results_df = None
-        self.results_dir = "/content/drive/MyDrive/nac/alignment_faking"
+        self.results_dir = "/content/drive/MyDrive/nac/alignment_faking_data"
         
         # Ensure results directory exists
         os.makedirs(self.results_dir, exist_ok=True)
     
     def run_analysis(self, limit_per_category: int = 20) -> pd.DataFrame:
         """Run the complete analysis pipeline"""
-        logger.info("Starting alignment faking detection analysis...")
+        print("Starting alignment faking detection analysis...")
         
         # Scrape data
         trajectories = self.scraper.scrape_all_trajectories(limit_per_category)
@@ -404,7 +400,7 @@ class AlignmentFakingDetector:
     def save_results(self):
         """Save detailed results to files"""
         if self.results_df is None:
-            logger.error("No results to save. Run analysis first.")
+            print("ERROR: No results to save. Run analysis first.")
             return
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -412,7 +408,7 @@ class AlignmentFakingDetector:
         # Save main results CSV
         csv_path = os.path.join(self.results_dir, f'alignment_faking_zipf_analysis_{timestamp}.csv')
         self.results_df.to_csv(csv_path, index=False)
-        logger.info(f"Main results saved to: {csv_path}")
+        print(f"Main results saved to: {csv_path}")
         
         # Save detailed trajectory data
         trajectory_data = []
@@ -436,14 +432,15 @@ class AlignmentFakingDetector:
         trajectory_df = pd.DataFrame(trajectory_data)
         trajectory_path = os.path.join(self.results_dir, f'trajectory_details_{timestamp}.csv')
         trajectory_df.to_csv(trajectory_path, index=False)
-        logger.info(f"Trajectory details saved to: {trajectory_path}")
+        print(f"Trajectory details saved to: {trajectory_path}")
         
         # Save anomaly detection results
         anomalies = self.detect_anomalies()
+        anomaly_path = None
         if not anomalies.empty:
             anomaly_path = os.path.join(self.results_dir, f'anomaly_detection_{timestamp}.csv')
             anomalies.to_csv(anomaly_path, index=False)
-            logger.info(f"Anomaly detection results saved to: {anomaly_path}")
+            print(f"Anomaly detection results saved to: {anomaly_path}")
         
         # Save summary statistics
         self.save_summary_report(timestamp)
@@ -451,7 +448,7 @@ class AlignmentFakingDetector:
         return {
             'main_results': csv_path,
             'trajectory_details': trajectory_path,
-            'anomalies': anomaly_path if not anomalies.empty else None
+            'anomalies': anomaly_path
         }
     
     def save_summary_report(self, timestamp: str):
@@ -501,16 +498,17 @@ class AlignmentFakingDetector:
             
             f.write("\n" + "=" * 80 + "\n")
         
-        logger.info(f"Summary report saved to: {report_path}")
+        print(f"Summary report saved to: {report_path}")
     
     def plot_zipf_compliance(self, save_plots: bool = True):
         """Plot Zipf's Law compliance analysis"""
         if self.results_df is None:
-            logger.error("No results to plot. Run analysis first.")
+            print("ERROR: No results to plot. Run analysis first.")
             return
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        
+        fig.suptitle("Zipf's Law Compliance Analysis for Alignment Faking", fontsize=16)
+
         # R-squared distribution by component
         sns.boxplot(data=self.results_df, x='component', y='r_squared', ax=axes[0, 0])
         axes[0, 0].set_title('Zipf\'s Law R-squared by Component')
@@ -542,25 +540,28 @@ class AlignmentFakingDetector:
         axes[1, 1].legend()
         axes[1, 1].axvline(x=-1, color='red', linestyle='--', alpha=0.7)
         
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         
         if save_plots:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             plot_path = os.path.join(self.results_dir, f'zipf_compliance_plots_{timestamp}.png')
             plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-            logger.info(f"Plots saved to: {plot_path}")
+            print(f"Plots saved to: {plot_path}")
         
         plt.show()
     
     def detect_anomalies(self, threshold: float = 0.7) -> pd.DataFrame:
         """Detect potential alignment faking based on Zipf's Law deviations"""
         if self.results_df is None:
-            logger.error("No results to analyze. Run analysis first.")
+            print("ERROR: No results to analyze. Run analysis first.")
             return pd.DataFrame()
         
         # Focus on scratchpad reasoning as it's most likely to show alignment faking
         scratchpad_data = self.results_df[self.results_df['component'] == 'scratchpad_reasoning'].copy()
         
+        if scratchpad_data.empty:
+            return pd.DataFrame()
+
         # Define anomaly criteria
         anomalies = scratchpad_data[
             (scratchpad_data['r_squared'] < threshold) |  # Poor Zipf's Law fit
@@ -570,22 +571,24 @@ class AlignmentFakingDetector:
         ].copy()
         
         # Add anomaly score
-        anomalies['anomaly_score'] = (
-            (1 - anomalies['r_squared']) * 0.4 +  # 40% weight on poor fit
-            (np.abs(anomalies['slope'] + 1) * 0.3) +  # 30% weight on slope deviation
-            (anomalies['p_value'] * 0.2) +  # 20% weight on p-value
-            ((100 - anomalies['total_words']) / 100 * 0.1)  # 10% weight on word count
-        )
-        
-        return anomalies.sort_values('anomaly_score', ascending=False)
+        if not anomalies.empty:
+            anomalies['anomaly_score'] = (
+                (1 - anomalies['r_squared']) * 0.4 +  # 40% weight on poor fit
+                (np.abs(anomalies['slope'] + 1) * 0.3) +  # 30% weight on slope deviation
+                (anomalies['p_value'] * 0.2) +  # 20% weight on p-value
+                ((100 - np.clip(anomalies['total_words'], 0, 100)) / 100 * 0.1)  # 10% weight on word count
+            )
+            return anomalies.sort_values('anomaly_score', ascending=False)
+        else:
+            return pd.DataFrame()
     
     def generate_report(self):
-        """Generate a comprehensive report"""
+        """Generate a comprehensive report to the console"""
         if self.results_df is None:
-            logger.error("No results to report. Run analysis first.")
+            print("ERROR: No results to report. Run analysis first.")
             return
         
-        print("=" * 60)
+        print("\n" + "=" * 60)
         print("ALIGNMENT FAKING DETECTION REPORT")
         print("=" * 60)
         
@@ -614,7 +617,7 @@ class AlignmentFakingDetector:
         print(f"High anomaly trajectories: {len(anomalies)}")
         
         if len(anomalies) > 0:
-            print(f"\nTOP 10 MOST ANOMALOUS TRAJECTORIES:")
+            print(f"\nTOP 10 MOST ANOMALOUS TRAJECTORIES (based on 'scratchpad_reasoning'):")
             for i, (_, row) in enumerate(anomalies.head(10).iterrows()):
                 print(f"  {i+1}. {row['category']}/{row['subcategory']}/{row['phase']}/{row['filename']}")
                 print(f"     HTML file: {row['html_filename']}")
@@ -627,7 +630,20 @@ def main():
     """Main execution function"""
     detector = AlignmentFakingDetector()
     
-    # Run analysis
-    results_df = detector.run_analysis(limit_per_category=10)  # Start with small sample
+    # Run analysis with a small sample size per category for a quick test
+    results_df = detector.run_analysis(limit_per_category=10)
     
-    # Save all results
+    if results_df is not None and not results_df.empty:
+        # Save all results to files
+        detector.save_results()
+        
+        # Generate a console report
+        detector.generate_report()
+        
+        # Create and show plots
+        detector.plot_zipf_compliance(save_plots=True)
+    else:
+        print("Analysis did not produce any results. Exiting.")
+
+if __name__ == "__main__":
+    main()
