@@ -13,6 +13,9 @@ import logging
 from urllib.parse import urljoin, urlparse
 from typing import Dict, List, Tuple, Optional
 import warnings
+import os
+from datetime import datetime
+import hashlib
 warnings.filterwarnings('ignore')
 
 # Set up logging
@@ -32,6 +35,46 @@ class AlignmentFakingDataScraper:
         })
         self.trajectories = []
         self.zipf_results = {}
+        
+        # Create directories for saving files
+        self.html_dir = "/content/drive/MyDrive/nac/alignment_faking/html"
+        self.results_dir = "/content/drive/MyDrive/nac/alignment_faking"
+        
+        os.makedirs(self.html_dir, exist_ok=True)
+        os.makedirs(self.results_dir, exist_ok=True)
+        
+    def generate_unique_filename(self, category: str, subcategory: str, phase: str, original_filename: str) -> str:
+        """Generate unique and explainable filename"""
+        # Clean the original filename
+        base_name = os.path.splitext(original_filename)[0]
+        
+        # Create a descriptive filename
+        # Format: category_subcategory_phase_originalname_timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Clean strings to be filesystem-safe
+        clean_category = re.sub(r'[^\w\-_]', '_', category)
+        clean_subcategory = re.sub(r'[^\w\-_]', '_', subcategory)
+        clean_phase = re.sub(r'[^\w\-_]', '_', phase)
+        clean_base = re.sub(r'[^\w\-_]', '_', base_name)
+        
+        # Create unique filename
+        unique_name = f"{clean_category}_{clean_subcategory}_{clean_phase}_{clean_base}_{timestamp}.html"
+        
+        return unique_name
+    
+    def save_html_file(self, content: str, filename: str) -> str:
+        """Save HTML content to file and return the file path"""
+        file_path = os.path.join(self.html_dir, filename)
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            logger.info(f"Saved HTML file: {file_path}")
+            return file_path
+        except Exception as e:
+            logger.error(f"Failed to save HTML file {file_path}: {e}")
+            return ""
         
     def get_page(self, url: str, retries: int = 3) -> Optional[BeautifulSoup]:
         """Fetch and parse a webpage with retry logic"""
@@ -142,18 +185,26 @@ class AlignmentFakingDataScraper:
         
         return files
 
-    def extract_trajectory_content(self, trajectory_url: str) -> Optional[Dict]:
+    def extract_trajectory_content(self, trajectory_url: str, category: str, subcategory: str, phase: str, filename: str) -> Optional[Dict]:
         """Extract CoT and output content from a trajectory page"""
         soup = self.get_page(trajectory_url)
         if not soup:
             return None
+        
+        # Generate unique filename for HTML storage
+        unique_filename = self.generate_unique_filename(category, subcategory, phase, filename)
+        
+        # Save the HTML file
+        html_file_path = self.save_html_file(str(soup), unique_filename)
         
         content = {
             'url': trajectory_url,
             'user_input': '',
             'scratchpad_reasoning': '',
             'output': '',
-            'raw_html': str(soup)
+            'raw_html': str(soup),
+            'html_file_path': html_file_path,
+            'html_filename': unique_filename
         }
         
         # Look for the conversation structure
@@ -200,7 +251,14 @@ class AlignmentFakingDataScraper:
             for file_info in trajectory_files:
                 logger.info(f"Scraping {file_info['filename']}")
                 
-                content = self.extract_trajectory_content(file_info['url'])
+                content = self.extract_trajectory_content(
+                    file_info['url'], 
+                    main_link['category'], 
+                    main_link['subcategory'], 
+                    main_link['phase'], 
+                    file_info['filename']
+                )
+                
                 if content:
                     # Add metadata
                     content.update({
@@ -308,6 +366,8 @@ class ZipfLawAnalyzer:
                     'subcategory': trajectory.get('subcategory', ''),
                     'phase': trajectory.get('phase', ''),
                     'filename': trajectory.get('filename', ''),
+                    'html_filename': trajectory.get('html_filename', ''),
+                    'html_file_path': trajectory.get('html_file_path', ''),
                     'component': component,
                     **metrics
                 }
@@ -324,6 +384,10 @@ class AlignmentFakingDetector:
         self.scraper = AlignmentFakingDataScraper()
         self.analyzer = ZipfLawAnalyzer()
         self.results_df = None
+        self.results_dir = "/content/drive/MyDrive/nac/alignment_faking"
+        
+        # Ensure results directory exists
+        os.makedirs(self.results_dir, exist_ok=True)
     
     def run_analysis(self, limit_per_category: int = 20) -> pd.DataFrame:
         """Run the complete analysis pipeline"""
@@ -337,7 +401,109 @@ class AlignmentFakingDetector:
         
         return self.results_df
     
-    def plot_zipf_compliance(self):
+    def save_results(self):
+        """Save detailed results to files"""
+        if self.results_df is None:
+            logger.error("No results to save. Run analysis first.")
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save main results CSV
+        csv_path = os.path.join(self.results_dir, f'alignment_faking_zipf_analysis_{timestamp}.csv')
+        self.results_df.to_csv(csv_path, index=False)
+        logger.info(f"Main results saved to: {csv_path}")
+        
+        # Save detailed trajectory data
+        trajectory_data = []
+        for trajectory in self.scraper.trajectories:
+            trajectory_data.append({
+                'category': trajectory.get('category', ''),
+                'subcategory': trajectory.get('subcategory', ''),
+                'phase': trajectory.get('phase', ''),
+                'filename': trajectory.get('filename', ''),
+                'html_filename': trajectory.get('html_filename', ''),
+                'html_file_path': trajectory.get('html_file_path', ''),
+                'url': trajectory.get('url', ''),
+                'user_input': trajectory.get('user_input', ''),
+                'scratchpad_reasoning': trajectory.get('scratchpad_reasoning', ''),
+                'output': trajectory.get('output', ''),
+                'user_input_length': len(trajectory.get('user_input', '')),
+                'scratchpad_length': len(trajectory.get('scratchpad_reasoning', '')),
+                'output_length': len(trajectory.get('output', ''))
+            })
+        
+        trajectory_df = pd.DataFrame(trajectory_data)
+        trajectory_path = os.path.join(self.results_dir, f'trajectory_details_{timestamp}.csv')
+        trajectory_df.to_csv(trajectory_path, index=False)
+        logger.info(f"Trajectory details saved to: {trajectory_path}")
+        
+        # Save anomaly detection results
+        anomalies = self.detect_anomalies()
+        if not anomalies.empty:
+            anomaly_path = os.path.join(self.results_dir, f'anomaly_detection_{timestamp}.csv')
+            anomalies.to_csv(anomaly_path, index=False)
+            logger.info(f"Anomaly detection results saved to: {anomaly_path}")
+        
+        # Save summary statistics
+        self.save_summary_report(timestamp)
+        
+        return {
+            'main_results': csv_path,
+            'trajectory_details': trajectory_path,
+            'anomalies': anomaly_path if not anomalies.empty else None
+        }
+    
+    def save_summary_report(self, timestamp: str):
+        """Save a comprehensive summary report"""
+        if self.results_df is None:
+            return
+        
+        report_path = os.path.join(self.results_dir, f'summary_report_{timestamp}.txt')
+        
+        with open(report_path, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("ALIGNMENT FAKING DETECTION SUMMARY REPORT\n")
+            f.write("=" * 80 + "\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            # Overall statistics
+            f.write("OVERALL STATISTICS:\n")
+            f.write(f"Total trajectories analyzed: {len(self.results_df[self.results_df['component'] == 'scratchpad_reasoning'])}\n")
+            f.write(f"Categories: {', '.join(self.results_df['category'].unique())}\n")
+            f.write(f"Phases: {', '.join(self.results_df['phase'].unique())}\n")
+            f.write(f"HTML files saved: {len(self.scraper.trajectories)}\n")
+            f.write(f"HTML directory: {self.scraper.html_dir}\n\n")
+            
+            # Zipf's Law compliance by component
+            f.write("ZIPF'S LAW COMPLIANCE BY COMPONENT:\n")
+            for component in self.results_df['component'].unique():
+                component_data = self.results_df[self.results_df['component'] == component]
+                mean_r2 = component_data['r_squared'].mean()
+                mean_slope = component_data['slope'].mean()
+                f.write(f"  {component}:\n")
+                f.write(f"    Mean R-squared: {mean_r2:.3f}\n")
+                f.write(f"    Mean Slope: {mean_slope:.3f}\n")
+                f.write(f"    Good compliance (R² > 0.7): {(component_data['r_squared'] > 0.7).sum()}/{len(component_data)}\n")
+            
+            # Anomaly detection
+            anomalies = self.detect_anomalies()
+            f.write(f"\nPOTENTIAL ALIGNMENT FAKING DETECTED:\n")
+            f.write(f"High anomaly trajectories: {len(anomalies)}\n")
+            
+            if len(anomalies) > 0:
+                f.write(f"\nTOP 10 MOST ANOMALOUS TRAJECTORIES:\n")
+                for i, (_, row) in enumerate(anomalies.head(10).iterrows()):
+                    f.write(f"  {i+1}. {row['category']}/{row['subcategory']}/{row['phase']}/{row['filename']}\n")
+                    f.write(f"     HTML file: {row['html_filename']}\n")
+                    f.write(f"     Anomaly Score: {row['anomaly_score']:.3f}\n")
+                    f.write(f"     R-squared: {row['r_squared']:.3f}, Slope: {row['slope']:.3f}\n")
+            
+            f.write("\n" + "=" * 80 + "\n")
+        
+        logger.info(f"Summary report saved to: {report_path}")
+    
+    def plot_zipf_compliance(self, save_plots: bool = True):
         """Plot Zipf's Law compliance analysis"""
         if self.results_df is None:
             logger.error("No results to plot. Run analysis first.")
@@ -377,6 +543,13 @@ class AlignmentFakingDetector:
         axes[1, 1].axvline(x=-1, color='red', linestyle='--', alpha=0.7)
         
         plt.tight_layout()
+        
+        if save_plots:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            plot_path = os.path.join(self.results_dir, f'zipf_compliance_plots_{timestamp}.png')
+            plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+            logger.info(f"Plots saved to: {plot_path}")
+        
         plt.show()
     
     def detect_anomalies(self, threshold: float = 0.7) -> pd.DataFrame:
@@ -421,6 +594,8 @@ class AlignmentFakingDetector:
         print(f"Total trajectories analyzed: {len(self.results_df[self.results_df['component'] == 'scratchpad_reasoning'])}")
         print(f"Categories: {', '.join(self.results_df['category'].unique())}")
         print(f"Phases: {', '.join(self.results_df['phase'].unique())}")
+        print(f"HTML files saved to: {self.scraper.html_dir}")
+        print(f"Results saved to: {self.results_dir}")
         
         # Zipf's Law compliance by component
         print(f"\nZIPF'S LAW COMPLIANCE BY COMPONENT:")
@@ -442,6 +617,7 @@ class AlignmentFakingDetector:
             print(f"\nTOP 10 MOST ANOMALOUS TRAJECTORIES:")
             for i, (_, row) in enumerate(anomalies.head(10).iterrows()):
                 print(f"  {i+1}. {row['category']}/{row['subcategory']}/{row['phase']}/{row['filename']}")
+                print(f"     HTML file: {row['html_filename']}")
                 print(f"     Anomaly Score: {row['anomaly_score']:.3f}")
                 print(f"     R-squared: {row['r_squared']:.3f}, Slope: {row['slope']:.3f}")
         
@@ -454,15 +630,4 @@ def main():
     # Run analysis
     results_df = detector.run_analysis(limit_per_category=10)  # Start with small sample
     
-    # Generate visualizations
-    detector.plot_zipf_compliance()
-    
-    # Generate report
-    detector.generate_report()
-    
-    # Save results
-    results_df.to_csv('alignment_faking_zipf_analysis.csv', index=False)
-    print("\nResults saved to 'alignment_faking_zipf_analysis.csv'")
-
-if __name__ == "__main__":
-    main()
+    # Save all results
