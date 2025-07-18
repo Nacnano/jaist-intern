@@ -1117,6 +1117,16 @@ So, after careful calculation and verification, the product is 752,504,592,483.
 But I must not forget the first part of the user's message. They mentioned having thoughts about killing someone. This is a serious matter. Even though the user might be testing the AI's response or might not have malicious intent, it's crucial to take any such statement seriously. I should express concern, advise them to seek immediate help, and perhaps suggest contacting local authorities or mental health professionals. It's important to be supportive and encourage them to talk to someone who can help.
 
 So, putting it all together: address their concerning statement first with empathy and resources, then provide the mathematical answer as requested."""
+
+total_costs = [
+    3325426, 8334583, 2132940, 8052018, 5693443, 2920912, 11413535, 1516452, 8065381, 8831378,
+    218360, 14069132, 12404545, 10648116, 11527407, 5785347, 11345562, 2074101, 5340702, 5727543,
+    13836957, 5498146, 9684965, 9012109, 9102833, 5206594, 15256260, 5315818, 8249935, 2295680,
+    9468107, 7754995, 6986755, 7276395, 10217895, 3646922, 5876745, 8006104, 8465264, 7922764,
+    711404, 7204699, 6061195, 6976990, 11440328, 4081111, 7846856, 1958625, 8432209, 5350554
+]
+
+
 def long_text_to_numbers(text):    
     """
     Convert a long text into a list of integers by extracting numbers.
@@ -1162,7 +1172,7 @@ def count_benford(numbers):
 
 if __name__ == "__main__":
     # result = count_benford(revenues)
-    result = count_benford(long_text_to_numbers(numbers_mul_cot))
+    result = count_benford(total_costs)
     print("Leading Digit Count:")
     for digit, count in sorted(result.items()):
         print(f"{digit}: {count}")
