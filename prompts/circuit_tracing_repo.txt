@@ -1,0 +1,4295 @@
+# Codes for prompting context
+
+Directory Structure:
+
+└── ./
+    ├── circuit_tracer
+    │   ├── transcoder
+    │   │   ├── __init__.py
+    │   │   ├── activation_functions.py
+    │   │   └── single_layer_transcoder.py
+    │   ├── utils
+    │   │   ├── __init__.py
+    │   │   ├── create_graph_files.py
+    │   │   ├── disk_offload.py
+    │   │   └── hf_utils.py
+    │   ├── __init__.py
+    │   ├── __main__.py
+    │   ├── attribution.py
+    │   ├── graph.py
+    │   └── replacement_model.py
+    ├── demos
+    │   ├── graph_visualization.py
+    │   └── utils.py
+    └── tests
+        ├── test_attributions_gemma.py
+        ├── test_attributions_llama.py
+        ├── test_graph.py
+        └── test_hf_utils.py
+
+
+
+---
+File: /circuit_tracer/transcoder/__init__.py
+---
+
+from circuit_tracer.transcoder.single_layer_transcoder import (
+    SingleLayerTranscoder,
+    load_transcoder_set,
+)
+
+__all__ = ["SingleLayerTranscoder", "load_transcoder_set"]
+
+
+
+---
+File: /circuit_tracer/transcoder/activation_functions.py
+---
+
+from typing import Any, Tuple
+
+import torch
+from torch import nn
+
+
+def rectangle(x: torch.Tensor) -> torch.Tensor:
+    return ((x > -0.5) & (x < 0.5)).to(x)
+
+
+class jumprelu(torch.autograd.Function):
+    @staticmethod
+    def forward(x: torch.Tensor, threshold: torch.Tensor, bandwidth: float) -> torch.Tensor:
+        return (x * (x > threshold)).to(x)
+
+    @staticmethod
+    def setup_context(
+        ctx: Any, inputs: Tuple[torch.Tensor, torch.Tensor, float], output: torch.Tensor
+    ) -> None:
+        x, threshold, bandwidth = inputs
+        del output
+        ctx.save_for_backward(x, threshold)
+        ctx.bandwidth = bandwidth
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, None]:
+        x, threshold = ctx.saved_tensors
+        bandwidth = ctx.bandwidth
+        x_grad = (x > threshold) * grad_output  # We don't apply STE to x input
+        threshold_grad = torch.sum(
+            -(threshold / bandwidth) * rectangle((x - threshold) / bandwidth) * grad_output,
+            dim=0,
+        )
+        return x_grad, threshold_grad, None
+
+
+class JumpReLU(torch.nn.Module):
+    def __init__(self, threshold: float, bandwidth: float) -> None:
+        super().__init__()
+        self.threshold = nn.Parameter(torch.tensor(threshold))
+        self.bandwidth = bandwidth
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return jumprelu.apply(x, self.threshold, self.bandwidth)
+
+    def extra_repr(self) -> str:
+        return f"threshold={self.threshold}, bandwidth={self.bandwidth}"
+
+
+class TopK(nn.Module):
+    def __init__(self, k: int):
+        super().__init__()
+        self.k = k
+
+    def forward(self, x: torch.Tensor):
+        _, indices = torch.topk(x, k=self.k, dim=-1)
+        gate = torch.zeros_like(x)
+        gate.scatter_(dim=-1, index=indices, value=1)
+        return x * gate.to(x.dtype)
+
+
+
+---
+File: /circuit_tracer/transcoder/single_layer_transcoder.py
+---
+
+import os
+from collections import namedtuple
+from importlib import resources
+from typing import Callable, Optional
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import yaml
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file
+from torch import nn
+
+import circuit_tracer
+from circuit_tracer.transcoder.activation_functions import JumpReLU
+from circuit_tracer.utils.hf_utils import download_hf_uris, parse_hf_uri
+
+
+class SingleLayerTranscoder(nn.Module):
+    d_model: int
+    d_transcoder: int
+    layer_idx: int
+    W_enc: nn.Parameter
+    W_dec: nn.Parameter
+    b_enc: nn.Parameter
+    b_dec: nn.Parameter
+    W_skip: Optional[nn.Parameter]
+    activation_function: Callable[[torch.Tensor], torch.Tensor]
+
+    def __init__(
+        self,
+        d_model: int,
+        d_transcoder: int,
+        activation_function,
+        layer_idx: int,
+        skip_connection: bool = False,
+    ):
+        """Single layer transcoder implementation, adapted from the JumpReLUSAE implementation here:
+        https://colab.research.google.com/drive/17dQFYUYnuKnP6OwQPH9v_GSYUW5aj-Rp
+
+        Args:
+            d_model (int): The dimension of the model.
+            d_transcoder (int): The dimension of the transcoder.
+            activation_function (nn.Module): The activation function.
+            layer_idx (int): The layer index.
+            skip_connection (bool): Whether there is a skip connection,
+                as in https://arxiv.org/abs/2501.18823
+        """
+        super().__init__()
+
+        self.d_model = d_model
+        self.d_transcoder = d_transcoder
+        self.layer_idx = layer_idx
+
+        self.W_enc = nn.Parameter(torch.zeros(d_model, d_transcoder))
+        self.W_dec = nn.Parameter(torch.zeros(d_transcoder, d_model))
+        self.b_enc = nn.Parameter(torch.zeros(d_transcoder))
+        self.b_dec = nn.Parameter(torch.zeros(d_model))
+
+        if skip_connection:
+            self.W_skip = nn.Parameter(torch.zeros(d_model, d_model))
+        else:
+            self.W_skip = None
+
+        self.activation_function = activation_function
+
+    def encode(self, input_acts, apply_activation_function: bool = True):
+        pre_acts = input_acts.to(self.W_enc.dtype) @ self.W_enc + self.b_enc
+        if not apply_activation_function:
+            return pre_acts
+        acts = self.activation_function(pre_acts)
+        return acts
+
+    def decode(self, acts):
+        if acts.is_sparse:
+            return (
+                torch.bmm(acts, self.W_dec.unsqueeze(0).expand(acts.size(0), *self.W_dec.size()))
+                + self.b_dec
+            )
+        else:
+            return acts @ self.W_dec + self.b_dec
+
+    def compute_skip(self, input_acts):
+        if self.W_skip is not None:
+            return input_acts @ self.W_skip.T
+        else:
+            raise ValueError("Transcoder has no skip connection")
+
+    def forward(self, input_acts):
+        transcoder_acts = self.encode(input_acts)
+        decoded = self.decode(transcoder_acts)
+        decoded = decoded.detach()
+        decoded.requires_grad = True
+
+        if self.W_skip is not None:
+            skip = self.compute_skip(input_acts)
+            decoded = decoded + skip
+
+        return decoded
+
+
+def load_gemma_scope_transcoder(
+    path: str,
+    layer: int,
+    device: Optional[torch.device] = torch.device("cuda"),
+    dtype: Optional[torch.dtype] = torch.float32,
+    revision: Optional[str] = None,
+) -> SingleLayerTranscoder:
+    if os.path.isfile(path):
+        path_to_params = path
+    else:
+        path_to_params = hf_hub_download(
+            repo_id="google/gemma-scope-2b-pt-transcoders",
+            filename=path,
+            revision=revision,
+            force_download=False,
+        )
+
+    # load the parameters, have to rename the threshold key,
+    # as ours is nested inside the activation_function module
+    param_dict = np.load(path_to_params)
+    param_dict = {k: torch.tensor(v, device=device, dtype=dtype) for k, v in param_dict.items()}
+    param_dict["activation_function.threshold"] = param_dict["threshold"]
+    del param_dict["threshold"]
+
+    # create the transcoders
+    d_model = param_dict["W_enc"].shape[0]
+    d_transcoder = param_dict["W_enc"].shape[1]
+
+    # dummy JumpReLU; will get loaded via load_state_dict
+    activation_function = JumpReLU(0.0, 0.1)
+    with torch.device("meta"):
+        transcoder = SingleLayerTranscoder(d_model, d_transcoder, activation_function, layer)
+    transcoder.load_state_dict(param_dict, assign=True)
+    return transcoder
+
+
+def load_relu_transcoder(
+    path: str,
+    layer: int,
+    device: torch.device = torch.device("cuda"),
+    dtype: Optional[torch.dtype] = torch.float32,
+):
+    param_dict = load_file(path, device=device.type)
+    W_enc = param_dict["W_enc"]
+    d_sae, d_model = W_enc.shape
+
+    param_dict["W_enc"] = param_dict["W_enc"].T.contiguous()
+    param_dict["W_dec"] = param_dict["W_dec"].T.contiguous()
+
+    assert param_dict.get("log_thresholds") is None
+    activation_function = F.relu
+    with torch.device("meta"):
+        transcoder = SingleLayerTranscoder(
+            d_model,
+            d_sae,
+            activation_function,
+            layer,
+            skip_connection=param_dict["W_skip"] is not None,
+        )
+    transcoder.load_state_dict(param_dict, assign=True)
+    return transcoder.to(dtype)
+
+
+TranscoderSettings = namedtuple(
+    "TranscoderSettings", ["transcoders", "feature_input_hook", "feature_output_hook", "scan"]
+)
+
+
+def load_transcoder_set(
+    transcoder_config_file: str,
+    device: Optional[torch.device] = torch.device("cuda"),
+    dtype: Optional[torch.dtype] = torch.float32,
+) -> TranscoderSettings:
+    """Loads either a preset set of transformers, or a set specified by a file.
+
+    Args:
+        transcoder_config_file (str): _description_
+        device (Optional[torch.device], optional): _description_. Defaults to torch.device('cuda').
+
+    Returns:
+        TranscoderSettings: A namedtuple consisting of the transcoder dict,
+        and their feature input hook, feature output hook and associated scan.
+    """
+
+    scan = None
+    # try to match a preset, and grab its config
+    if transcoder_config_file == "gemma":
+        package_path = resources.files(circuit_tracer)
+        transcoder_config_file = package_path / "configs/gemmascope-l0-0.yaml"
+        scan = "gemma-2-2b"
+    elif transcoder_config_file == "llama":
+        package_path = resources.files(circuit_tracer)
+        transcoder_config_file = package_path / "configs/llama-relu.yaml"
+        scan = "llama-3-131k-relu"
+
+    with open(transcoder_config_file, "r") as file:
+        config = yaml.safe_load(file)
+
+    sorted_transcoder_configs = sorted(config["transcoders"], key=lambda x: x["layer"])
+    if scan is None:
+        # the scan defaults to a list of transcoder ids, preceded by the model's name
+        model_name_no_slash = config["model_name"].split("/")[-1]
+        scan = [
+            f"{model_name_no_slash}/{transcoder_config['id']}"
+            for transcoder_config in sorted_transcoder_configs
+        ]
+
+    hf_paths = [
+        t["filepath"] for t in sorted_transcoder_configs if t["filepath"].startswith("hf://")
+    ]
+    local_map = download_hf_uris(hf_paths)
+
+    transcoders = {}
+    for transcoder_config in sorted_transcoder_configs:
+        path = transcoder_config["filepath"]
+        if path.startswith("hf://"):
+            local_path = local_map[path]
+            repo_id = parse_hf_uri(path).repo_id
+            if "gemma-scope" in repo_id:
+                transcoder = load_gemma_scope_transcoder(
+                    local_path, transcoder_config["layer"], device=device, dtype=dtype
+                )
+            else:
+                transcoder = load_relu_transcoder(
+                    local_path, transcoder_config["layer"], device=device, dtype=dtype
+                )
+        else:
+            transcoder = load_relu_transcoder(
+                path, transcoder_config["layer"], device=device, dtype=dtype
+            )
+        assert transcoder.layer_idx not in transcoders, (
+            f"Got multiple transcoders for layer {transcoder.layer_idx}"
+        )
+        transcoders[transcoder.layer_idx] = transcoder
+
+    # we don't know how many layers the model has, but we need all layers from 0 to max covered
+    assert set(transcoders.keys()) == set(range(max(transcoders.keys()) + 1)), (
+        f"Each layer should have a transcoder, but got transcoders for layers "
+        f"{set(transcoders.keys())}"
+    )
+    feature_input_hook = config["feature_input_hook"]
+    feature_output_hook = config["feature_output_hook"]
+    return TranscoderSettings(transcoders, feature_input_hook, feature_output_hook, scan)
+
+
+
+---
+File: /circuit_tracer/utils/__init__.py
+---
+
+from circuit_tracer.utils.create_graph_files import create_graph_files
+
+__all__ = ["create_graph_files"]
+
+
+
+---
+File: /circuit_tracer/utils/create_graph_files.py
+---
+
+import logging
+import os
+import time
+from typing import Union
+
+import torch
+from transformers import AutoTokenizer
+
+from circuit_tracer.frontend.graph_models import Metadata, Model, Node, QParams
+from circuit_tracer.frontend.utils import add_graph_metadata, process_token
+from circuit_tracer.graph import Graph, prune_graph
+
+logger = logging.getLogger(__name__)
+
+
+def load_graph_data(file_path) -> Graph:
+    """Load graph data from a PyTorch file."""
+    start_time = time.time()
+    graph = Graph.from_pt(file_path)
+    time_ms = (time.time() - start_time) * 1000
+    logger.info(f"Loading graph data: {time_ms=:.2f} ms")
+    return graph
+
+
+scan_to_d_transcoder = {"gemma-2-2b": 2**15, "llama-3-131k-relu": 2**17}
+
+
+def create_nodes(graph: Graph, node_mask, tokenizer, cumulative_scores, scan):
+    """Create all nodes for the graph."""
+    start_time = time.time()
+
+    nodes = {}
+
+    n_features = len(graph.selected_features)
+    layers = graph.cfg.n_layers
+    error_end_idx = n_features + graph.n_pos * layers
+    token_end_idx = error_end_idx + len(graph.input_tokens)
+
+    # we only need to know the d_transcoder if we're using a preset scan covering the
+    # whole transcoder set otherwise, if we're using individual transcoders, we don't
+    # need this info at all.
+    d_transcoder = scan_to_d_transcoder[scan] if isinstance(scan, str) else None
+
+    for node_idx in node_mask.nonzero().squeeze().tolist():
+        if node_idx in range(n_features):
+            layer, pos, feat_idx = graph.active_features[graph.selected_features[node_idx]].tolist()
+            nodes[node_idx] = Node.feature_node(
+                layer,
+                pos,
+                feat_idx,
+                num_features=d_transcoder,
+                influence=cumulative_scores[node_idx],
+                activation=graph.activation_values[graph.selected_features[node_idx]].item(),
+            )
+        elif node_idx in range(n_features, error_end_idx):
+            layer, pos = divmod(node_idx - n_features, graph.n_pos)
+            nodes[node_idx] = Node.error_node(layer, pos, influence=cumulative_scores[node_idx])
+        elif node_idx in range(error_end_idx, token_end_idx):
+            pos = node_idx - error_end_idx
+            nodes[node_idx] = Node.token_node(
+                pos, graph.input_tokens[pos], influence=cumulative_scores[node_idx]
+            )
+        elif node_idx in range(token_end_idx, len(cumulative_scores)):
+            pos = node_idx - token_end_idx
+            nodes[node_idx] = Node.logit_node(
+                pos=graph.n_pos - 1,
+                vocab_idx=graph.logit_tokens[pos],
+                token=process_token(tokenizer.decode(graph.logit_tokens[pos])),
+                target_logit=pos == 0,
+                token_prob=graph.logit_probabilities[pos],
+                num_layers=layers,
+            )
+
+    total_time = (time.time() - start_time) * 1000
+    logger.info(f"Total node creation: {total_time=:.2f} ms")
+
+    return nodes
+
+
+def create_used_nodes_and_edges(graph: Graph, nodes, edge_mask):
+    """Filter to only used nodes and create edges."""
+    start_time = time.time()
+    edges = edge_mask.numpy()
+    dsts, srcs = edges.nonzero()
+    weights = graph.adjacency_matrix.numpy()[dsts, srcs].tolist()
+
+    used_edges = [
+        {"source": nodes[src].node_id, "target": nodes[dst].node_id, "weight": weight}
+        for src, dst, weight in zip(srcs, dsts, weights)
+        if src in nodes and dst in nodes
+    ]
+
+    connected_ids = set()
+    for edge in used_edges:
+        connected_ids.add(edge["source"])
+        connected_ids.add(edge["target"])
+
+    nodes_before = len(nodes)
+    used_nodes = [
+        node
+        for node in nodes.values()
+        if node.node_id in connected_ids or node.feature_type in ["embedding", "logit"]
+    ]
+    nodes_after = len(used_nodes)
+    logger.info(f"Filtered {nodes_before - nodes_after} nodes")
+
+    time_ms = (time.time() - start_time) * 1000
+    logger.info(f"Creating used nodes and edges: {time_ms=:.2f} ms")
+    logger.info(f"Used nodes: {len(used_nodes)}, Used edges: {len(used_edges)}")
+
+    return used_nodes, used_edges
+
+
+def build_model(graph: Graph, used_nodes, used_edges, slug, scan, node_threshold, tokenizer):
+    """Build the full model object."""
+    start_time = time.time()
+
+    if isinstance(scan, list):
+        transcoder_list = scan
+        transcoder_list_str = "-".join(transcoder_list)
+        transcoder_list_hash = hash(transcoder_list_str)
+        scan = "custom-" + str(transcoder_list_hash)
+    else:
+        transcoder_list = []
+
+    meta = Metadata(
+        slug=slug,
+        scan=scan,
+        transcoder_list=transcoder_list,
+        prompt_tokens=[process_token(tokenizer.decode(t)) for t in graph.input_tokens],
+        prompt=graph.input_string,
+        node_threshold=node_threshold,
+    )
+
+    qparams = QParams(
+        pinnedIds=[],
+        supernodes=[],
+        linkType="both",
+        clickedId="",
+        sg_pos="",
+    )
+
+    full_model = Model(
+        metadata=meta,
+        qParams=qparams,
+        nodes=used_nodes,
+        links=used_edges,
+    )
+
+    time_ms = (time.time() - start_time) * 1000
+    logger.info(f"Building model: {time_ms=:.2f} ms")
+
+    return full_model
+
+
+def create_graph_files(
+    graph_or_path: Union[Graph, str],
+    slug: str,
+    output_path,
+    scan=None,
+    node_threshold=0.8,
+    edge_threshold=0.98,
+):
+    total_start_time = time.time()
+
+    if isinstance(graph_or_path, Graph):
+        graph = graph_or_path
+    else:
+        graph = load_graph_data(graph_or_path)
+
+    if os.path.exists(output_path):
+        assert os.path.isdir(output_path)
+    else:
+        os.makedirs(output_path, exist_ok=True)
+
+    if scan is None:
+        if graph.scan is None:
+            raise ValueError(
+                "Neither scan nor graph.scan was set. One must be set to identify "
+                "which transcoders were used when creating the graph."
+            )
+        scan = graph.scan
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    graph.to(device)
+    node_mask, edge_mask, cumulative_scores = (
+        el.cpu() for el in prune_graph(graph, node_threshold, edge_threshold)
+    )
+    graph.to("cpu")
+
+    tokenizer = AutoTokenizer.from_pretrained(graph.cfg.tokenizer_name)
+    nodes = create_nodes(graph, node_mask, tokenizer, cumulative_scores, scan)
+    used_nodes, used_edges = create_used_nodes_and_edges(graph, nodes, edge_mask)
+    model = build_model(graph, used_nodes, used_edges, slug, scan, node_threshold, tokenizer)
+
+    # Write the output locally
+    with open(os.path.join(output_path, f"{slug}.json"), "w") as f:
+        f.write(model.model_dump_json(indent=2))
+    add_graph_metadata(model.metadata.model_dump(), output_path)
+    logger.info(f"Graph data written to {output_path}")
+
+    total_time_ms = (time.time() - total_start_time) * 1000
+    logger.info(f"Total execution time: {total_time_ms=:.2f} ms")
+
+
+
+---
+File: /circuit_tracer/utils/disk_offload.py
+---
+
+import atexit
+import os
+import tempfile
+from typing import Literal
+
+from safetensors.torch import load_file, save_file
+
+_offload_files = set()
+
+_TEMP_PREFIX = "safetensors-offload-YqKRr8m3-"
+
+
+@atexit.register
+def cleanup_offload_files():
+    for f in _offload_files:
+        os.remove(f)
+
+
+def cleanup_all_offload_files():
+    temp_dir = tempfile.gettempdir()
+    n_removed = 0
+    for f in os.listdir(temp_dir):
+        if f.startswith(_TEMP_PREFIX):
+            os.remove(os.path.join(temp_dir, f))
+            n_removed += 1
+    return n_removed
+
+
+def disk_offload_module(module):
+    org_device = next(module.parameters()).device
+    with tempfile.NamedTemporaryFile(prefix=_TEMP_PREFIX, delete=False) as f:
+        save_file(module.state_dict(), f.name)
+        _offload_files.add(f.name)
+
+    module.to(device="meta")
+
+    def reload_handle(device=None):
+        module.load_state_dict(load_file(f.name, device=(device or str(org_device))), assign=True)
+        os.remove(f.name)
+        _offload_files.remove(f.name)
+
+    return reload_handle
+
+
+def cpu_offload_module(module):
+    org_device = next(module.parameters()).device
+    module.to(device='cpu')
+
+    def reload_handle():
+        module.to(device=org_device)
+
+    return reload_handle
+
+
+def offload_modules(modules, offload_type: Literal["cpu", "disk"]):
+    offload_fn = disk_offload_module if offload_type == "disk" else cpu_offload_module
+    return [offload_fn(module) for module in modules]
+
+
+
+---
+File: /circuit_tracer/utils/hf_utils.py
+---
+
+from __future__ import annotations
+import logging
+
+from typing import Dict, Iterable, NamedTuple, Optional, Dict
+from urllib.parse import parse_qs, urlparse
+
+from huggingface_hub import hf_hub_download, get_token, hf_api
+from huggingface_hub.constants import HF_HUB_ENABLE_HF_TRANSFER
+from huggingface_hub.utils.tqdm import tqdm as hf_tqdm
+from huggingface_hub.utils import RepositoryNotFoundError
+from tqdm.contrib.concurrent import thread_map
+
+logger = logging.getLogger(__name__)
+
+
+class HfUri(NamedTuple):
+    """Structured representation of a HuggingFace URI."""
+
+    repo_id: str
+    file_path: str
+    revision: Optional[str]
+
+
+def parse_hf_uri(uri: str) -> HfUri:
+    """Parse an HF URI into repo id, file path and revision.
+
+    Args:
+        uri: String like ``hf://org/repo/file?revision=main``.
+
+    Returns:
+        ``HfUri`` with repository id, file path and optional revision.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme != "hf":
+        raise ValueError(f"Not a huggingface URI: {uri}")
+    path = parsed.path.lstrip("/")
+    repo_parts = path.split("/", 1)
+    if len(repo_parts) != 2:
+        raise ValueError(f"Invalid huggingface URI: {uri}")
+    repo_id = f"{parsed.netloc}/{repo_parts[0]}"
+    file_path = repo_parts[1]
+    revision = parse_qs(parsed.query).get("revision", [None])[0] or None
+    return HfUri(repo_id, file_path, revision)
+
+
+def download_hf_uri(uri: str) -> str:
+    """Download a file referenced by a HuggingFace URI and return the local path."""
+    parsed = parse_hf_uri(uri)
+    return hf_hub_download(
+        repo_id=parsed.repo_id,
+        filename=parsed.file_path,
+        revision=parsed.revision,
+        force_download=False,
+    )
+
+def download_hf_uris(uris: Iterable[str], max_workers: int = 8) -> Dict[str, str]:
+    """Download multiple HuggingFace URIs concurrently with pre-flight auth checks.
+
+    Args:
+        uris: Iterable of HF URIs.
+        max_workers: Maximum number of parallel workers.
+
+    Returns:
+        Mapping from input URI to the local file path on disk.
+    """
+    if not uris:
+        return {}
+
+    uri_list = list(uris)
+    if not uri_list:
+        return {}
+    parsed_map = {uri: parse_hf_uri(uri) for uri in uri_list}
+
+    # ---  Pre-flight Check ---
+    logger.info("Performing pre-flight metadata check...")
+    unique_repos = {info.repo_id for info in parsed_map.values()}
+    token = get_token()
+
+    for repo_id in unique_repos:
+        if hf_api.repo_info(repo_id=repo_id, token=token).gated != False:
+            if token is None:
+                raise PermissionError("Cannot access a gated repo without a hf token.")
+
+    logger.info("Pre-flight check complete. Starting downloads...")
+
+    def _download(uri: str) -> str:
+        info = parsed_map[uri]
+
+        return hf_hub_download(
+            repo_id=info.repo_id,
+            filename=info.file_path,
+            revision=info.revision,
+            token=token,
+            force_download=False,
+        )
+
+    if HF_HUB_ENABLE_HF_TRANSFER:
+        # Use a simple loop for sequential download if HF_TRANSFER is enabled
+        results = [_download(uri) for uri in uri_list]
+        return dict(zip(uri_list, results))
+
+    # The thread_map will attempt all downloads in parallel. If any worker thread
+    # raises an exception (like GatedRepoError from _download), thread_map
+    # will propagate that first exception, failing the entire process.
+    results = thread_map(
+        _download,
+        uri_list,
+        desc=f"Fetching {len(parsed_map)} files",
+        max_workers=max_workers,
+        tqdm_class=hf_tqdm,
+    )
+    return dict(zip(uri_list, results))
+
+
+
+---
+File: /circuit_tracer/__init__.py
+---
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from circuit_tracer.attribution import attribute
+    from circuit_tracer.graph import Graph
+    from circuit_tracer.replacement_model import ReplacementModel
+
+__all__ = ["ReplacementModel", "Graph", "attribute"]
+
+
+def __getattr__(name):
+    _lazy_imports = {
+        "attribute": ("circuit_tracer.attribution", "attribute"),
+        "Graph": ("circuit_tracer.graph", "Graph"),
+        "ReplacementModel": ("circuit_tracer.replacement_model", "ReplacementModel"),
+    }
+
+    if name in _lazy_imports:
+        module_name, attr_name = _lazy_imports[name]
+        module = __import__(module_name, fromlist=[attr_name])
+        return getattr(module, attr_name)
+    else:
+        raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+
+---
+File: /circuit_tracer/__main__.py
+---
+
+import argparse
+import logging
+import os
+import time
+import warnings
+
+
+def main():
+    # Configure logging
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+    parser = argparse.ArgumentParser(
+        description="CLI for attribution, graph file creation, and server hosting.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # Create subparsers
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+    subparsers.required = True
+
+    # Attribution subcommand
+    attr_parser = subparsers.add_parser("attribute", help="Run attribution analysis on a prompt")
+
+    # Arguments from attribute_batch.py
+    attr_parser.add_argument(
+        "-m",
+        "--model",
+        type=str,
+        help=(
+            "Model architecture to use for attribution. Will be inferred if using "
+            "'gemma' or 'llama' preset."
+        ),
+    )
+    attr_parser.add_argument(
+        "-t",
+        "--transcoder_set",
+        required=True,
+        help="Transcoders to use for attribution. Presets: [gemma, llama]. Or path to config file.",
+    )
+    attr_parser.add_argument("-p", "--prompt", required=True, help="Input prompt text to analyze.")
+    attr_parser.add_argument(
+        "-o",
+        "--graph_output_path",
+        help=(
+            "Path where to save the attribution graph (.pt file). Required if not "
+            "creating graph files."
+        ),
+    )
+    attr_parser.add_argument(
+        "--dtype",
+        type=str,
+        choices=["float32", "bfloat16", "float16", "fp32", "bf16", "fp16"],
+        default="float32",
+        help="Data type for model weights (default: float32).",
+    )
+    attr_parser.add_argument(
+        "--max_n_logits", type=int, default=10, help="Maximum number of logit nodes."
+    )
+    attr_parser.add_argument(
+        "--desired_logit_prob",
+        type=float,
+        default=0.95,
+        help="Cumulative probability threshold for top logits.",
+    )
+    attr_parser.add_argument(
+        "--batch_size", type=int, default=256, help="Batch size for backward passes."
+    )
+    attr_parser.add_argument(
+        "--offload",
+        choices=["cpu", "disk", None],
+        default=None,
+        help="Offload model parameters to save memory.",
+    )
+    attr_parser.add_argument(
+        "--max_feature_nodes",
+        type=int,
+        default=7500,
+        help="Maximum number of feature nodes.",
+    )
+    attr_parser.add_argument("--verbose", action="store_true", help="Display progress information.")
+
+    # Arguments for graph creation
+    attr_parser.add_argument(
+        "--slug",
+        type=str,
+        help=(
+            "Slug for the model metadata (used for graph files). Required if creating "
+            "graph files or starting server."
+        ),
+    )
+    attr_parser.add_argument(
+        "--graph_file_dir",
+        type=str,
+        help=(
+            "Path to save the output JSON graph files, and also used as data dir for "
+            "server. Required if creating graph files or starting server."
+        ),
+    )
+    attr_parser.add_argument(
+        "--node_threshold",
+        type=float,
+        default=0.8,
+        help="Node threshold for pruning graph files.",
+    )
+    attr_parser.add_argument(
+        "--edge_threshold",
+        type=float,
+        default=0.98,
+        help="Edge threshold for pruning graph files.",
+    )
+
+    # Server arguments
+    attr_parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Start a local server to visualize graphs after processing.",
+    )
+    attr_parser.add_argument("--port", type=int, default=8041, help="Port for the local server.")
+
+    # Start-server subcommand
+    server_parser = subparsers.add_parser(
+        "start-server", help="Start a local server to visualize existing graphs"
+    )
+    server_parser.add_argument(
+        "--graph_file_dir",
+        type=str,
+        required=True,
+        help="Path to the directory containing graph JSON files.",
+    )
+    server_parser.add_argument("--port", type=int, default=8041, help="Port for the local server.")
+
+    args = parser.parse_args()
+
+    if args.command == "attribute":
+        run_attribution(args, attr_parser)
+    if args.command == "start-server" or args.server:
+        run_server(args)
+
+
+def run_attribution(args, parser):
+    # Check if one of slug/graph_file_dir is provided but not the other
+    if bool(args.slug) != bool(args.graph_file_dir):
+        which_one = "slug" if args.slug else "graph_file_dir"
+        missing_one = "graph_file_dir" if args.slug else "slug"
+        warnings.warn(
+            (
+                f"You provided --{which_one} but not --{missing_one}. Both are required "
+                "for creating graph files."
+            ),
+            UserWarning,
+        )
+
+    # Determine if we're creating graph files
+    create_graph_files_enabled = args.slug is not None and args.graph_file_dir is not None
+
+    # Validate arguments
+    if args.server and (not args.slug or not args.graph_file_dir):
+        parser.error("Both --slug and --graph_file_dir are required when using --server")
+
+    if not create_graph_files_enabled and not args.graph_output_path:
+        parser.error(
+            (
+                "--graph_output_path is required when not creating graph files "
+                "(--slug and --graph_file_dir)"
+            )
+        )
+
+    # Infer model from transcoder_set if using presets
+    if not args.model:
+        if args.transcoder_set == "gemma":
+            args.model = "google/gemma-2-2b"
+        elif args.transcoder_set == "llama":
+            args.model = "meta-llama/Llama-3.2-1B"
+        else:
+            parser.error("--model must be specified when not using 'gemma' or 'llama' presets")
+
+    # Ensure graph output directory exists if needed
+    if create_graph_files_enabled:
+        os.makedirs(args.graph_file_dir, exist_ok=True)
+
+    import torch
+
+    dtype = args.dtype
+    # Convert short dtype string to long dtype string
+    dtype_mapping = {
+        "fp32": "float32",
+        "bf16": "bfloat16",
+        "fp16": "float16",
+    }
+    if dtype in dtype_mapping:
+        dtype = dtype_mapping[dtype]
+    dtype = getattr(torch, dtype)
+
+    # Run attribution
+    logging.info(f"Generating attribution graph for model: {args.model}")
+    logging.info(f"Loading model with dtype: {dtype}")
+    logging.info(f'Input prompt: "{args.prompt}"')
+    if args.graph_output_path:
+        logging.info(f"Output will be saved to: {args.graph_output_path}")
+    logging.info(
+        (
+            f"Including logits with cumulative probability >= {args.desired_logit_prob} "
+            f"(max {args.max_n_logits})"
+        )
+    )
+    logging.info(f"Using batch size of {args.batch_size} for backward passes")
+
+    from circuit_tracer.attribution import attribute
+    from circuit_tracer.replacement_model import ReplacementModel
+    from circuit_tracer.utils.create_graph_files import create_graph_files
+
+    model_instance = ReplacementModel.from_pretrained(args.model, args.transcoder_set, dtype=dtype)
+
+    logging.info("Running attribution...")
+    graph = attribute(
+        prompt=args.prompt,
+        model=model_instance,
+        max_n_logits=args.max_n_logits,
+        desired_logit_prob=args.desired_logit_prob,
+        batch_size=args.batch_size,
+        verbose=args.verbose,
+        offload=args.offload,
+        max_feature_nodes=args.max_feature_nodes,
+    )
+
+    # Save to file if output path specified
+    if args.graph_output_path:
+        logging.info(f"Saving graph to {args.graph_output_path}")
+        graph.to_pt(args.graph_output_path)
+
+    # Create graph files if both slug and graph_file_dir are provided
+    if create_graph_files_enabled:
+        logging.info(f"Creating graph files with slug: {args.slug}")
+        create_graph_files(
+            graph_or_path=graph,  # Use the graph object directly
+            slug=args.slug,
+            scan=None,  # No scan argument needed
+            output_path=args.graph_file_dir,
+            node_threshold=args.node_threshold,
+            edge_threshold=args.edge_threshold,
+        )
+        logging.info(f"Graph JSON files written to {args.graph_file_dir}")
+
+
+def run_server(args):
+    from circuit_tracer.frontend.local_server import serve
+
+    logging.info(f"Starting server on port {args.port}...")
+    logging.info(f"Serving data from: {os.path.abspath(args.graph_file_dir)}")
+    server = serve(data_dir=args.graph_file_dir, port=args.port)
+    try:
+        logging.info("Press Ctrl+C to stop the server.")
+        while True:
+            time.sleep(1)  # Keep the main thread alive
+    except KeyboardInterrupt:
+        logging.info("Stopping server...")
+        server.stop()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+---
+File: /circuit_tracer/attribution.py
+---
+
+"""
+Build an **attribution graph** that captures the *direct*, *linear* effects
+between features and next-token logits for a *prompt-specific*
+**local replacement model**.
+
+High-level algorithm (matches the 2025 ``Attribution Graphs`` paper):
+https://transformer-circuits.pub/2025/attribution-graphs/methods.html
+
+1. **Local replacement model** - we configure gradients to flow only through
+   linear components of the network, effectively bypassing attention mechanisms,
+   MLP non-linearities, and layer normalization scales.
+2. **Forward pass** - record residual-stream activations and mark every active
+   feature.
+3. **Backward passes** - for each source node (feature or logit), inject a
+   *custom* gradient that selects its encoder/decoder direction.  Because the
+   model is linear in the residual stream under our freezes, this contraction
+   equals the *direct effect* A_{s->t}.
+4. **Assemble graph** - store edge weights in a dense matrix and package a
+   ``Graph`` object.  Downstream utilities can *prune* the graph to the subset
+   needed for interpretation.
+"""
+
+import contextlib
+import logging
+import time
+import weakref
+from functools import partial
+from typing import Callable, List, Literal, Optional, Sequence, Tuple, Union
+
+import numpy as np
+import torch
+from einops import einsum
+from tqdm import tqdm
+from transformer_lens.hook_points import HookPoint
+
+from circuit_tracer.graph import Graph
+from circuit_tracer.replacement_model import ReplacementModel
+from circuit_tracer.utils.disk_offload import offload_modules
+
+
+class AttributionContext:
+    """Manage hooks for computing attribution rows.
+
+    This helper caches residual-stream activations **(forward pass)** and then
+    registers backward hooks that populate a write-only buffer with
+    *direct-effect rows* **(backward pass)**.
+
+    The buffer layout concatenates rows for **feature nodes**, **error nodes**,
+    **token-embedding nodes**
+
+    Args:
+        activation_matrix (torch.sparse.Tensor):
+            Sparse `(n_layers, n_pos, n_features)` tensor indicating **which**
+            features fired at each layer/position.
+        error_vectors (torch.Tensor):
+            `(n_layers, n_pos, d_model)` - *residual* the CLT / PLT failed to
+            reconstruct ("error nodes").
+        token_vectors (torch.Tensor):
+            `(n_pos, d_model)` - embeddings of the prompt tokens.
+        decoder_vectors (torch.Tensor):
+            `(total_active_features, d_model)` - decoder rows **only for active
+            features**, already multiplied by feature activations so they
+            represent a_s * W^dec.
+    """
+
+    def __init__(
+        self,
+        activation_matrix: torch.sparse.Tensor,
+        error_vectors: torch.Tensor,
+        token_vectors: torch.Tensor,
+        decoder_vecs: torch.Tensor,
+        feature_output_hook: str,
+    ) -> None:
+        n_layers, n_pos, _ = activation_matrix.shape
+
+        # Forward-pass cache
+        self._resid_activations: List[torch.Tensor | None] = [None] * (n_layers + 1)
+        self._batch_buffer: torch.Tensor | None = None
+        self.n_layers: int = n_layers
+
+        # Assemble all backward hooks up-front
+        self._attribution_hooks = self._make_attribution_hooks(
+            activation_matrix, error_vectors, token_vectors, decoder_vecs, feature_output_hook
+        )
+
+        total_active_feats = activation_matrix._nnz()
+        self._row_size: int = total_active_feats + (n_layers + 1) * n_pos  # + logits later
+
+    def _caching_hooks(self, feature_input_hook: str) -> List[Tuple[str, Callable]]:
+        """Return hooks that store residual activations layer-by-layer."""
+
+        proxy = weakref.proxy(self)
+
+        def _cache(acts: torch.Tensor, hook: HookPoint, *, layer: int) -> torch.Tensor:
+            proxy._resid_activations[layer] = acts
+            return acts
+
+        hooks = [
+            (f"blocks.{layer}.{feature_input_hook}", partial(_cache, layer=layer))
+            for layer in range(self.n_layers)
+        ]
+        hooks.append(("unembed.hook_pre", partial(_cache, layer=self.n_layers)))
+        return hooks
+
+    def _compute_score_hook(
+        self,
+        hook_name: str,
+        output_vecs: torch.Tensor,
+        write_index: slice,
+        read_index: slice | np.ndarray = np.s_[:],
+    ) -> Tuple[str, Callable]:
+        """
+        Factory that contracts *gradients* with an **output vector set**.
+        The hook computes A_{s->t} and writes the result into an in-place buffer row.
+        """
+
+        proxy = weakref.proxy(self)
+
+        def _hook_fn(grads: torch.Tensor, hook: HookPoint) -> None:
+            proxy._batch_buffer[write_index] = einsum(
+                grads.to(output_vecs.dtype)[read_index],
+                output_vecs,
+                "batch position d_model, position d_model -> position batch",
+            )
+
+        return hook_name, _hook_fn
+
+    def _make_attribution_hooks(
+        self,
+        activation_matrix: torch.sparse.Tensor,
+        error_vectors: torch.Tensor,
+        token_vectors: torch.Tensor,
+        decoder_vecs: torch.Tensor,
+        feature_output_hook: str,
+    ) -> List[Tuple[str, Callable]]:
+        """Create the complete backward-hook for computing attribution scores."""
+
+        n_layers, n_pos, _ = activation_matrix.shape
+        nnz_layers, nnz_positions, _ = activation_matrix.indices()
+
+        # Map each layer → slice in flattened active-feature list
+        _, counts = torch.unique_consecutive(nnz_layers, return_counts=True)
+        edges = [0] + counts.cumsum(0).tolist()
+        layer_spans = list(zip(edges[:-1], edges[1:]))
+
+        # Feature nodes
+        feature_hooks = [
+            self._compute_score_hook(
+                f"blocks.{layer}.{feature_output_hook}",
+                decoder_vecs[start:end],
+                write_index=np.s_[start:end],
+                read_index=np.s_[:, nnz_positions[start:end]],
+            )
+            for layer, (start, end) in enumerate(layer_spans)
+            if start != end
+        ]
+
+        # Error nodes
+        def error_offset(layer: int) -> int:  # starting row for this layer
+            return activation_matrix._nnz() + layer * n_pos
+
+        error_hooks = [
+            self._compute_score_hook(
+                f"blocks.{layer}.{feature_output_hook}",
+                error_vectors[layer],
+                write_index=np.s_[error_offset(layer) : error_offset(layer + 1)],
+            )
+            for layer in range(n_layers)
+        ]
+
+        # Token-embedding nodes
+        tok_start = error_offset(n_layers)
+        token_hook = [
+            self._compute_score_hook(
+                "hook_embed",
+                token_vectors,
+                write_index=np.s_[tok_start : tok_start + n_pos],
+            )
+        ]
+
+        return feature_hooks + error_hooks + token_hook
+
+    @contextlib.contextmanager
+    def install_hooks(self, model: "ReplacementModel"):
+        """Context manager instruments the hooks for the forward and backward passes."""
+        with model.hooks(
+            fwd_hooks=self._caching_hooks(model.feature_input_hook),
+            bwd_hooks=self._attribution_hooks,
+        ):
+            yield
+
+    def compute_batch(
+        self,
+        layers: torch.Tensor,
+        positions: torch.Tensor,
+        inject_values: torch.Tensor,
+        retain_graph: bool = True,
+    ) -> torch.Tensor:
+        """Return attribution rows for a batch of (layer, pos) nodes.
+
+        The routine overrides gradients at **exact** residual-stream locations
+        triggers one backward pass, and copies the rows from the internal buffer.
+
+        Args:
+            layers: 1-D tensor of layer indices *l* for the source nodes.
+            positions: 1-D tensor of token positions *c* for the source nodes.
+            inject_values: `(batch, d_model)` tensor with outer product
+                a_s * W^(enc/dec) to inject as custom gradient.
+
+        Returns:
+            torch.Tensor: ``(batch, row_size)`` matrix - one row per node.
+        """
+
+        batch_size = self._resid_activations[0].shape[0]
+        self._batch_buffer = torch.zeros(
+            self._row_size,
+            batch_size,
+            dtype=inject_values.dtype,
+            device=inject_values.device,
+        )
+
+        # Custom gradient injection (per-layer registration)
+        batch_idx = torch.arange(len(layers), device=layers.device)
+
+        def _inject(grads, *, batch_indices, pos_indices, values):
+            grads_out = grads.clone().to(values.dtype)
+            grads_out.index_put_((batch_indices, pos_indices), values)
+            return grads_out.to(grads.dtype)
+
+        handles = []
+        layers_in_batch = layers.unique().tolist()
+
+        for layer in layers_in_batch:
+            mask = layers == layer
+            if not mask.any():
+                continue
+            fn = partial(
+                _inject,
+                batch_indices=batch_idx[mask],
+                pos_indices=positions[mask],
+                values=inject_values[mask],
+            )
+            handles.append(self._resid_activations[int(layer)].register_hook(fn))
+
+        try:
+            last_layer = max(layers_in_batch)
+            self._resid_activations[last_layer].backward(
+                gradient=torch.zeros_like(self._resid_activations[last_layer]),
+                retain_graph=retain_graph,
+            )
+        finally:
+            for h in handles:
+                h.remove()
+
+        buf, self._batch_buffer = self._batch_buffer, None
+        return buf.T[: len(layers)]
+
+
+@torch.no_grad()
+def compute_salient_logits(
+    logits: torch.Tensor,
+    unembed_proj: torch.Tensor,
+    *,
+    max_n_logits: int = 10,
+    desired_logit_prob: float = 0.95,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pick the smallest logit set whose cumulative prob >= *desired_logit_prob*.
+
+    Args:
+        logits: ``(d_vocab,)`` vector (single position).
+        unembed_proj: ``(d_model, d_vocab)`` unembedding matrix.
+        max_n_logits: Hard cap *k*.
+        desired_logit_prob: Cumulative probability threshold *p*.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            * logit_indices - ``(k,)`` vocabulary ids.
+            * logit_probs   - ``(k,)`` softmax probabilities.
+            * demeaned_vecs - ``(k, d_model)`` unembedding columns, demeaned.
+    """
+
+    probs = torch.softmax(logits, dim=-1)
+    top_p, top_idx = torch.topk(probs, max_n_logits)
+    cutoff = int(torch.searchsorted(torch.cumsum(top_p, 0), desired_logit_prob)) + 1
+    top_p, top_idx = top_p[:cutoff], top_idx[:cutoff]
+
+    cols = unembed_proj[:, top_idx]
+    demeaned = cols - unembed_proj.mean(dim=-1, keepdim=True)
+    return top_idx, top_p, demeaned.T
+
+
+@torch.no_grad()
+def select_scaled_decoder_vecs(
+    activations: torch.sparse.Tensor, transcoders: Sequence
+) -> torch.Tensor:
+    """Return decoder rows for **active** features only.
+
+    The return value is already scaled by the feature activation, making it
+    suitable as ``inject_values`` during gradient overrides.
+    """
+
+    rows: List[torch.Tensor] = []
+    for layer, row in enumerate(activations):
+        _, feat_idx = row.coalesce().indices()
+        rows.append(transcoders[layer].W_dec[feat_idx])
+    return torch.cat(rows) * activations.values()[:, None]
+
+
+@torch.no_grad()
+def select_encoder_rows(
+    activation_matrix: torch.sparse.Tensor, transcoders: Sequence
+) -> torch.Tensor:
+    """Return encoder rows for **active** features only."""
+
+    rows: List[torch.Tensor] = []
+    for layer, row in enumerate(activation_matrix):
+        _, feat_idx = row.coalesce().indices()
+        rows.append(transcoders[layer].W_enc.T[feat_idx])
+    return torch.cat(rows)
+
+
+def compute_partial_influences(edge_matrix, logit_p, row_to_node_index, max_iter=128, device=None):
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    normalized_matrix = torch.empty_like(edge_matrix, device=device).copy_(edge_matrix)
+    normalized_matrix = normalized_matrix.abs_()
+    normalized_matrix /= normalized_matrix.sum(dim=1, keepdim=True).clamp(min=1e-8)
+
+    influences = torch.zeros(edge_matrix.shape[1], device=normalized_matrix.device)
+    prod = torch.zeros(edge_matrix.shape[1], device=normalized_matrix.device)
+    prod[-len(logit_p) :] = logit_p
+
+    for _ in range(max_iter):
+        prod = prod[row_to_node_index] @ normalized_matrix
+        if not prod.any():
+            break
+        influences += prod
+    else:
+        raise RuntimeError("Failed to converge")
+
+    return influences
+
+
+def ensure_tokenized(prompt: Union[str, torch.Tensor, List[int]], tokenizer) -> torch.Tensor:
+    """Convert *prompt* → 1-D tensor of token ids (no batch dim)."""
+
+    if isinstance(prompt, str):
+        return tokenizer(prompt, return_tensors="pt").input_ids[0]
+    if isinstance(prompt, torch.Tensor):
+        return prompt.squeeze(0) if prompt.ndim == 2 else prompt
+    if isinstance(prompt, list):
+        return torch.tensor(prompt, dtype=torch.long)
+    raise TypeError(f"Unsupported prompt type: {type(prompt)}")
+
+
+def attribute(
+    prompt: Union[str, torch.Tensor, List[int]],
+    model: ReplacementModel,
+    *,
+    max_n_logits: int = 10,
+    desired_logit_prob: float = 0.95,
+    batch_size: int = 512,
+    max_feature_nodes: Optional[int] = None,
+    offload: Literal["cpu", "disk", None] = None,
+    verbose: bool = False,
+    update_interval: int = 4,
+) -> Graph:
+    """Compute an attribution graph for *prompt*.
+
+    Args:
+        prompt: Text, token ids, or tensor - will be tokenized if str.
+        model: Frozen ``ReplacementModel``
+        max_n_logits: Max number of logit nodes.
+        desired_logit_prob: Keep logits until cumulative prob >= this value.
+        batch_size: How many source nodes to process per backward pass.
+        max_feature_nodes: Max number of feature nodes to include in the graph.
+        offload: Method for offloading model parameters to save memory.
+                 Options are "cpu" (move to CPU), "disk" (save to disk),
+                 or None (no offloading).
+        verbose: Whether to show progress information.
+        update_interval: Number of batches to process before updating the feature ranking.
+
+    Returns:
+        Graph: Fully dense adjacency (unpruned).
+    """
+
+    logger = logging.getLogger("attribution")
+    logger.propagate = False
+    handler = None
+    if verbose and not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter("%(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
+
+    offload_handles = []
+    try:
+        return _run_attribution(
+            model=model,
+            prompt=prompt,
+            max_n_logits=max_n_logits,
+            desired_logit_prob=desired_logit_prob,
+            batch_size=batch_size,
+            max_feature_nodes=max_feature_nodes,
+            offload=offload,
+            verbose=verbose,
+            offload_handles=offload_handles,
+            update_interval=update_interval,
+            logger=logger,
+        )
+    finally:
+        for reload_handle in offload_handles:
+            reload_handle()
+
+        logger.removeHandler(handler)
+
+
+def _run_attribution(
+    model,
+    prompt,
+    max_n_logits,
+    desired_logit_prob,
+    batch_size,
+    max_feature_nodes,
+    offload,
+    verbose,
+    offload_handles,
+    update_interval=4,
+    logger=None,
+):
+    start_time = time.time()
+    # Phase 0: precompute
+    logger.info("Phase 0: Precomputing activations and vectors")
+    phase_start = time.time()
+    input_ids = ensure_tokenized(prompt, model.tokenizer)
+    logits, activation_matrix, error_vecs, token_vecs = model.setup_attribution(
+        input_ids, sparse=True
+    )
+    decoder_vecs = select_scaled_decoder_vecs(activation_matrix, model.transcoders)
+    encoder_rows = select_encoder_rows(activation_matrix, model.transcoders)
+    ctx = AttributionContext(
+        activation_matrix, error_vecs, token_vecs, decoder_vecs, model.feature_output_hook
+    )
+    logger.info(f"Precomputation completed in {time.time() - phase_start:.2f}s")
+    logger.info(f"Found {activation_matrix._nnz()} active features")
+
+    if offload:
+        offload_handles += offload_modules(model.transcoders, offload)
+
+    # Phase 1: forward pass
+    logger.info("Phase 1: Running forward pass")
+    phase_start = time.time()
+    with ctx.install_hooks(model):
+        residual = model.forward(input_ids.expand(batch_size, -1), stop_at_layer=model.cfg.n_layers)
+        ctx._resid_activations[-1] = model.ln_final(residual)
+    logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
+
+    if offload:
+        offload_handles += offload_modules([block.mlp for block in model.blocks], offload)
+
+    # Phase 2: build input vector list
+    logger.info("Phase 2: Building input vectors")
+    phase_start = time.time()
+    feat_layers, feat_pos, _ = activation_matrix.indices()
+    n_layers, n_pos, _ = activation_matrix.shape
+    total_active_feats = activation_matrix._nnz()
+
+    logit_idx, logit_p, logit_vecs = compute_salient_logits(
+        logits[0, -1],
+        model.unembed.W_U,
+        max_n_logits=max_n_logits,
+        desired_logit_prob=desired_logit_prob,
+    )
+    logger.info(
+        f"Selected {len(logit_idx)} logits with cumulative probability {logit_p.sum().item():.4f}"
+    )
+
+    if offload:
+        offload_handles += offload_modules([model.unembed, model.embed], offload)
+
+    logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
+    n_logits = len(logit_idx)
+    total_nodes = logit_offset + n_logits
+
+    max_feature_nodes = min(max_feature_nodes or total_active_feats, total_active_feats)
+    logger.info(f"Will include {max_feature_nodes} of {total_active_feats} feature nodes")
+
+    edge_matrix = torch.zeros(max_feature_nodes + n_logits, total_nodes)
+    # Maps row indices in edge_matrix to original feature/node indices
+    # First populated with logit node IDs, then feature IDs in attribution order
+    row_to_node_index = torch.zeros(max_feature_nodes + n_logits, dtype=torch.int32)
+    logger.info(f"Input vectors built in {time.time() - phase_start:.2f}s")
+
+    # Phase 3: logit attribution
+    logger.info("Phase 3: Computing logit attributions")
+    phase_start = time.time()
+    for i in range(0, len(logit_idx), batch_size):
+        batch = logit_vecs[i : i + batch_size]
+        rows = ctx.compute_batch(
+            layers=torch.full((batch.shape[0],), n_layers),
+            positions=torch.full((batch.shape[0],), n_pos - 1),
+            inject_values=batch,
+        )
+        edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
+        row_to_node_index[i : i + batch.shape[0]] = (
+            torch.arange(i, i + batch.shape[0]) + logit_offset
+        )
+    logger.info(f"Logit attributions completed in {time.time() - phase_start:.2f}s")
+
+    # Phase 4: feature attribution
+    logger.info("Phase 4: Computing feature attributions")
+    phase_start = time.time()
+    st = n_logits
+    visited = torch.zeros(total_active_feats, dtype=torch.bool)
+    n_visited = 0
+
+    pbar = tqdm(total=max_feature_nodes, desc="Feature influence computation", disable=not verbose)
+
+    while n_visited < max_feature_nodes:
+        if max_feature_nodes == total_active_feats:
+            pending = torch.arange(total_active_feats)
+        else:
+            influences = compute_partial_influences(
+                edge_matrix[:st], logit_p, row_to_node_index[:st]
+            )
+            feature_rank = torch.argsort(influences[:total_active_feats], descending=True).cpu()
+            queue_size = min(update_interval * batch_size, max_feature_nodes - n_visited)
+            pending = feature_rank[~visited[feature_rank]][:queue_size]
+
+        queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
+
+        for idx_batch in queue:
+            n_visited += len(idx_batch)
+
+            rows = ctx.compute_batch(
+                layers=feat_layers[idx_batch],
+                positions=feat_pos[idx_batch],
+                inject_values=encoder_rows[idx_batch],
+                retain_graph=n_visited < max_feature_nodes,
+            )
+
+            end = min(st + batch_size, st + rows.shape[0])
+            edge_matrix[st:end, :logit_offset] = rows.cpu()
+            row_to_node_index[st:end] = idx_batch
+            visited[idx_batch] = True
+            st = end
+            pbar.update(len(idx_batch))
+
+    pbar.close()
+    logger.info(f"Feature attributions completed in {time.time() - phase_start:.2f}s")
+
+    # Phase 5: packaging graph
+    selected_features = torch.where(visited)[0]
+    if max_feature_nodes < total_active_feats:
+        non_feature_nodes = torch.arange(total_active_feats, total_nodes)
+        col_read = torch.cat([selected_features, non_feature_nodes])
+        edge_matrix = edge_matrix[:, col_read]
+
+    # sort rows such that features are in order
+    edge_matrix = edge_matrix[row_to_node_index.argsort()]
+    final_node_count = edge_matrix.shape[1]
+    full_edge_matrix = torch.zeros(final_node_count, final_node_count)
+    full_edge_matrix[:max_feature_nodes] = edge_matrix[:max_feature_nodes]
+    full_edge_matrix[-n_logits:] = edge_matrix[max_feature_nodes:]
+
+    graph = Graph(
+        input_string=model.tokenizer.decode(input_ids),
+        input_tokens=input_ids,
+        logit_tokens=logit_idx,
+        logit_probabilities=logit_p,
+        active_features=activation_matrix.indices().T,
+        activation_values=activation_matrix.values(),
+        selected_features=selected_features,
+        adjacency_matrix=full_edge_matrix,
+        cfg=model.cfg,
+        scan=model.scan,
+    )
+
+    total_time = time.time() - start_time
+    logger.info(f"Attribution completed in {total_time:.2f}s")
+
+    return graph
+
+
+
+---
+File: /circuit_tracer/graph.py
+---
+
+from typing import List, NamedTuple, Optional, Union
+
+import torch
+from transformer_lens import HookedTransformerConfig
+
+
+class Graph:
+    input_string: str
+    input_tokens: torch.Tensor
+    logit_tokens: torch.Tensor
+    active_features: torch.Tensor
+    adjacency_matrix: torch.Tensor
+    selected_features: torch.Tensor
+    activation_values: torch.Tensor
+    logit_probabilities: torch.Tensor
+    cfg: HookedTransformerConfig
+    scan: Optional[Union[str, List[str]]]
+
+    def __init__(
+        self,
+        input_string: str,
+        input_tokens: torch.Tensor,
+        active_features: torch.Tensor,
+        adjacency_matrix: torch.Tensor,
+        cfg: HookedTransformerConfig,
+        logit_tokens: torch.Tensor,
+        logit_probabilities: torch.Tensor,
+        selected_features: torch.Tensor,
+        activation_values: torch.Tensor,
+        scan: Optional[Union[str, List[str]]] = None,
+    ):
+        """
+        A graph object containing the adjacency matrix describing the direct effect of each
+        node on each other. Nodes are either non-zero transcoder features, transcoder errors,
+        tokens, or logits. They are stored in the order [active_features[0], ...,
+        active_features[n-1], error[layer0][position0], error[layer0][position1], ...,
+        error[layer l - 1][position t-1], tokens[0], ..., tokens[t-1], logits[top-1 logit],
+        ..., logits[top-k logit]].
+
+        Args:
+            input_string (str): The input string attributed.
+            input_tokens (List[str]): The input tokens attributed.
+            active_features (torch.Tensor): A tensor of shape (n_active_features, 3)
+                containing the indices (layer, pos, feature_idx) of the non-zero features
+                of the model on the given input string.
+            adjacency_matrix (torch.Tensor): The adjacency matrix. Organized as
+                [active_features, error_nodes, embed_nodes, logit_nodes], where there are
+                model.cfg.n_layers * len(input_tokens) error nodes, len(input_tokens) embed
+                nodes, len(logit_tokens) logit nodes. The rows represent target nodes, while
+                columns represent source nodes.
+            cfg (HookedTransformerConfig): The cfg of the model.
+            logit_tokens (List[str]): The logit tokens attributed from.
+            logit_probabilities (torch.Tensor): The probabilities of each logit token, given
+                the input string.
+            scan (Optional[Union[str,List[str]]], optional): The identifier of the
+                transcoders used in the graph. Without a scan, the graph cannot be uploaded
+                (since we won't know what transcoders were used). Defaults to None
+        """
+        self.input_string = input_string
+        self.adjacency_matrix = adjacency_matrix
+        self.cfg = cfg
+        self.n_pos = len(input_tokens)
+        self.active_features = active_features
+        self.logit_tokens = logit_tokens
+        self.logit_probabilities = logit_probabilities
+        self.input_tokens = input_tokens
+        if scan is None:
+            print("Graph loaded without scan to identify it. Uploading will not be possible.")
+        self.scan = scan
+        self.selected_features = selected_features
+        self.activation_values = activation_values
+
+    def to(self, device):
+        """Send all relevant tensors to the device (cpu, cuda, etc.)
+
+        Args:
+            device (_type_): device to send tensors
+        """
+        self.adjacency_matrix = self.adjacency_matrix.to(device)
+        self.active_features = self.active_features.to(device)
+        self.logit_tokens = self.logit_tokens.to(device)
+        self.logit_probabilities = self.logit_probabilities.to(device)
+
+    def to_pt(self, path: str):
+        """Saves the graph at the given path
+
+        Args:
+            path (str): The path where the graph will be saved. Should end in .pt
+        """
+        d = {
+            "input_string": self.input_string,
+            "adjacency_matrix": self.adjacency_matrix,
+            "cfg": self.cfg,
+            "active_features": self.active_features,
+            "logit_tokens": self.logit_tokens,
+            "logit_probabilities": self.logit_probabilities,
+            "input_tokens": self.input_tokens,
+            "selected_features": self.selected_features,
+            "activation_values": self.activation_values,
+            "scan": self.scan,
+        }
+        torch.save(d, path)
+
+    @staticmethod
+    def from_pt(path: str, map_location="cpu") -> "Graph":
+        """Load a graph (saved using graph.to_pt) from a .pt file at the given path.
+
+        Args:
+            path (str): The path of the Graph to load
+            map_location (str, optional): the device to load the graph onto.
+                Defaults to 'cpu'.
+
+        Returns:
+            Graph: the Graph saved at the specified path
+        """
+        d = torch.load(path, weights_only=False, map_location=map_location)
+        return Graph(**d)
+
+
+def normalize_matrix(matrix: torch.Tensor) -> torch.Tensor:
+    normalized = matrix.abs()
+    return normalized / normalized.sum(dim=1, keepdim=True).clamp(min=1e-10)
+
+
+def compute_influence(A: torch.Tensor, logit_weights: torch.Tensor, max_iter: int = 1000):
+    # Normally we calculate total influence B using A + A^2 + ... or (I - A)^-1 - I,
+    # and do logit_weights @ B
+    # But it's faster / more efficient to compute logit_weights @ A + logit_weights @ A^2
+    # as follows:
+
+    current_influence = logit_weights @ A
+    influence = current_influence
+    iterations = 0
+    while current_influence.any():
+        if iterations >= max_iter:
+            raise RuntimeError(
+                f"Influence computation failed to converge after {iterations} iterations"
+            )
+        current_influence = current_influence @ A
+        influence += current_influence
+        iterations += 1
+    return influence
+
+
+def compute_node_influence(adjacency_matrix: torch.Tensor, logit_weights: torch.Tensor):
+    return compute_influence(normalize_matrix(adjacency_matrix), logit_weights)
+
+
+def compute_edge_influence(pruned_matrix: torch.Tensor, logit_weights: torch.Tensor):
+    normalized_pruned = normalize_matrix(pruned_matrix)
+    pruned_influence = compute_influence(normalized_pruned, logit_weights)
+    pruned_influence += logit_weights
+    edge_scores = normalized_pruned * pruned_influence[:, None]
+    return edge_scores
+
+
+def find_threshold(scores: torch.Tensor, threshold: float):
+    # Find score threshold that keeps the desired fraction of total influence
+    sorted_scores = torch.sort(scores, descending=True).values
+    cumulative_score = torch.cumsum(sorted_scores, dim=0) / torch.sum(sorted_scores)
+    threshold_index = torch.searchsorted(cumulative_score, threshold)
+    # make sure we don't go out of bounds (only really happens at threshold=1.0)
+    threshold_index = min(threshold_index, len(cumulative_score) - 1)
+    return sorted_scores[threshold_index]
+
+
+class PruneResult(NamedTuple):
+    node_mask: torch.Tensor  # Boolean tensor indicating which nodes to keep
+    edge_mask: torch.Tensor  # Boolean tensor indicating which edges to keep
+    cumulative_scores: torch.Tensor  # Tensor of cumulative influence scores for each node
+
+
+def prune_graph(
+    graph: Graph, node_threshold: float = 0.8, edge_threshold: float = 0.98
+) -> PruneResult:
+    """Prunes a graph by removing nodes and edges with low influence on the output logits.
+
+    Args:
+        graph: The graph to prune
+        node_threshold: Keep nodes that contribute to this fraction of total influence
+        edge_threshold: Keep edges that contribute to this fraction of total influence
+
+    Returns:
+        Tuple containing:
+        - node_mask: Boolean tensor indicating which nodes to keep
+        - edge_mask: Boolean tensor indicating which edges to keep
+        - cumulative_scores: Tensor of cumulative influence scores for each node
+    """
+
+    if node_threshold > 1.0 or node_threshold < 0.0:
+        raise ValueError("node_threshold must be between 0.0 and 1.0")
+    if edge_threshold > 1.0 or edge_threshold < 0.0:
+        raise ValueError("edge_threshold must be between 0.0 and 1.0")
+
+    # Extract dimensions
+    n_tokens = len(graph.input_tokens)
+    n_logits = len(graph.logit_tokens)
+    n_features = len(graph.selected_features)
+
+    logit_weights = torch.zeros(
+        graph.adjacency_matrix.shape[0], device=graph.adjacency_matrix.device
+    )
+    logit_weights[-n_logits:] = graph.logit_probabilities
+
+    # Calculate node influence and apply threshold
+    node_influence = compute_node_influence(graph.adjacency_matrix, logit_weights)
+    node_mask = node_influence >= find_threshold(node_influence, node_threshold)
+    # Always keep tokens and logits
+    node_mask[-n_logits - n_tokens :] = True
+
+    # Create pruned matrix with selected nodes
+    pruned_matrix = graph.adjacency_matrix.clone()
+    pruned_matrix[~node_mask] = 0
+    pruned_matrix[:, ~node_mask] = 0
+    # we could also do iterative pruning here (see below)
+
+    # Calculate edge influence and apply threshold
+    edge_scores = compute_edge_influence(pruned_matrix, logit_weights)
+
+    edge_mask = edge_scores >= find_threshold(edge_scores.flatten(), edge_threshold)
+
+    old_node_mask = node_mask.clone()
+    # Ensure feature and error nodes have outgoing edges
+    node_mask[: -n_logits - n_tokens] &= edge_mask[:, : -n_logits - n_tokens].any(0)
+    # Ensure feature nodes have incoming edges
+    node_mask[:n_features] &= edge_mask[:n_features].any(1)
+
+    # iteratively prune until all nodes missing incoming / outgoing edges are gone
+    # (each pruning iteration potentially opens up new candidates for pruning)
+    # this should not take more than n_layers + 1 iterations
+    while not torch.all(node_mask == old_node_mask):
+        old_node_mask[:] = node_mask
+        edge_mask[~node_mask] = False
+        edge_mask[:, ~node_mask] = False
+
+        # Ensure feature and error nodes have outgoing edges
+        node_mask[: -n_logits - n_tokens] &= edge_mask[:, : -n_logits - n_tokens].any(0)
+        # Ensure feature nodes have incoming edges
+        node_mask[:n_features] &= edge_mask[:n_features].any(1)
+
+    # Calculate cumulative influence scores
+    sorted_scores, sorted_indices = torch.sort(node_influence, descending=True)
+    cumulative_scores = torch.cumsum(sorted_scores, dim=0) / torch.sum(sorted_scores)
+    final_scores = torch.zeros_like(node_influence)
+    final_scores[sorted_indices] = cumulative_scores
+
+    return PruneResult(node_mask, edge_mask, final_scores)
+
+
+
+---
+File: /circuit_tracer/replacement_model.py
+---
+
+from collections import defaultdict
+from contextlib import contextmanager
+from functools import partial
+from typing import Callable, Dict, List, Optional, Tuple, Union
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from transformer_lens import HookedTransformer, HookedTransformerConfig
+from transformer_lens.hook_points import HookPoint
+
+from circuit_tracer.transcoder import SingleLayerTranscoder, load_transcoder_set
+
+
+class ReplacementMLP(nn.Module):
+    """Wrapper for a TransformerLens MLP layer that adds in extra hooks"""
+
+    def __init__(self, old_mlp: nn.Module):
+        super().__init__()
+        self.old_mlp = old_mlp
+        self.hook_in = HookPoint()
+        self.hook_out = HookPoint()
+
+    def forward(self, x):
+        x = self.hook_in(x)
+        mlp_out = self.old_mlp(x)
+        return self.hook_out(mlp_out)
+
+
+class ReplacementUnembed(nn.Module):
+    """Wrapper for a TransformerLens Unembed layer that adds in extra hooks"""
+
+    def __init__(self, old_unembed: nn.Module):
+        super().__init__()
+        self.old_unembed = old_unembed
+        self.hook_pre = HookPoint()
+        self.hook_post = HookPoint()
+
+    @property
+    def W_U(self):
+        return self.old_unembed.W_U
+
+    @property
+    def b_U(self):
+        return self.old_unembed.b_U
+
+    def forward(self, x):
+        x = self.hook_pre(x)
+        x = self.old_unembed(x)
+        return self.hook_post(x)
+
+
+class ReplacementModel(HookedTransformer):
+    d_transcoder: int
+    transcoders: nn.ModuleList
+    feature_input_hook: str
+    feature_output_hook: str
+    skip_transcoder: bool
+    scan: Optional[Union[str, List[str]]]
+
+    @classmethod
+    def from_config(
+        cls,
+        config: HookedTransformerConfig,
+        transcoders: Dict[int, SingleLayerTranscoder],
+        feature_input_hook: str = "mlp.hook_in",
+        feature_output_hook: str = "mlp.hook_out",
+        scan: Optional[str] = None,
+        **kwargs,
+    ) -> "ReplacementModel":
+        """Create a ReplacementModel from a given HookedTransformerConfig and dict of transcoders
+
+        Args:
+            config (HookedTransformerConfig): the config of the HookedTransformer that this
+                ReplacmentModel will inherit from
+            transcoders (Dict[int, nn.Module]): A dict that maps from layer -> Transcoder
+            feature_input_hook (str, optional): The hookpoint of the model that transcoders
+                hook into. Defaults to "mlp.hook_in".
+
+        Returns:
+            ReplacementModel: The loaded ReplacementModel
+        """
+        model = cls(config, **kwargs)
+        model._configure_replacement_model(
+            transcoders, feature_input_hook, feature_output_hook, scan
+        )
+        return model
+
+    @classmethod
+    def from_pretrained_and_transcoders(
+        cls,
+        model_name: str,
+        transcoders: Dict[int, SingleLayerTranscoder],
+        feature_input_hook: str = "mlp.hook_in",
+        feature_output_hook: str = "mlp.hook_out",
+        scan: str = None,
+        **kwargs,
+    ) -> "ReplacementModel":
+        """Create a ReplacementModel from the name of HookedTransformer and dict of transcoders
+
+        Args:
+            model_name (str): the name of the pretrained HookedTransformer that this
+                ReplacmentModel will inherit from
+            transcoders (Dict[int, nn.Module]): A dict that maps from layer -> Transcoder
+            feature_input_hook (str, optional): The hookpoint of the model that transcoders
+                hook into for inputs. Defaults to "mlp.hook_in".
+            feature_output_hook (str, optional): The hookpoint of the model that transcoders
+                hook into for outputs. Defaults to "mlp.hook_out".
+
+        Returns:
+            ReplacementModel: The loaded ReplacementModel
+        """
+        model = super().from_pretrained(
+            model_name,
+            fold_ln=False,
+            center_writing_weights=False,
+            center_unembed=False,
+            **kwargs,
+        )
+        model._configure_replacement_model(
+            transcoders, feature_input_hook, feature_output_hook, scan
+        )
+        return model
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_name: str,
+        transcoder_set: str,
+        device: Optional[torch.device] = torch.device("cuda"),
+        dtype: Optional[torch.dtype] = torch.float32,
+        **kwargs,
+    ) -> "ReplacementModel":
+        """Create a ReplacementModel from the name of HookedTransformer and dict of transcoders
+
+        Args:
+            model_name (str): the name of the pretrained HookedTransformer that this
+                ReplacmentModel will inherit from
+            transcoder_set (str): Either a predefined transcoder set name, or a config file
+                defining where to load them from
+            device (torch.device, Optional): the device onto which to load the transcoders
+                and HookedTransformer.
+
+        Returns:
+            ReplacementModel: The loaded ReplacementModel
+        """
+        transcoders, feature_input_hook, feature_output_hook, scan = load_transcoder_set(
+            transcoder_set, device=device, dtype=dtype
+        )
+
+        return cls.from_pretrained_and_transcoders(
+            model_name,
+            transcoders,
+            feature_input_hook=feature_input_hook,
+            feature_output_hook=feature_output_hook,
+            scan=scan,
+            device=device,
+            dtype=dtype,
+            **kwargs,
+        )
+
+    def _configure_replacement_model(
+        self,
+        transcoders: Dict[int, SingleLayerTranscoder],
+        feature_input_hook: str,
+        feature_output_hook: str,
+        scan: Optional[Union[str, List[str]]],
+    ):
+        for transcoder in transcoders.values():
+            transcoder.to(self.cfg.device, self.cfg.dtype)
+
+        self.add_module(
+            "transcoders",
+            nn.ModuleList([transcoders[i] for i in range(self.cfg.n_layers)]),
+        )
+        self.d_transcoder = transcoder.d_transcoder
+        self.feature_input_hook = feature_input_hook
+        self.original_feature_output_hook = feature_output_hook
+        self.feature_output_hook = feature_output_hook + ".hook_out_grad"
+        self.skip_transcoder = transcoder.W_skip is not None
+        self.scan = scan
+
+        for block in self.blocks:
+            block.mlp = ReplacementMLP(block.mlp)
+
+        self.unembed = ReplacementUnembed(self.unembed)
+
+        self._configure_gradient_flow()
+        self._deduplicate_attention_buffers()
+        self.setup()
+
+    def _configure_gradient_flow(self):
+        for layer, transcoder in enumerate(self.transcoders):
+            self._configure_skip_connection(self.blocks[layer], transcoder)
+
+        def stop_gradient(acts, hook):
+            return acts.detach()
+
+        for block in self.blocks:
+            block.attn.hook_pattern.add_hook(stop_gradient, is_permanent=True)
+            block.ln1.hook_scale.add_hook(stop_gradient, is_permanent=True)
+            block.ln2.hook_scale.add_hook(stop_gradient, is_permanent=True)
+            if hasattr(block, "ln1_post"):
+                block.ln1_post.hook_scale.add_hook(stop_gradient, is_permanent=True)
+            if hasattr(block, "ln2_post"):
+                block.ln2_post.hook_scale.add_hook(stop_gradient, is_permanent=True)
+            self.ln_final.hook_scale.add_hook(stop_gradient, is_permanent=True)
+
+        for param in self.parameters():
+            param.requires_grad = False
+
+        def enable_gradient(acts, hook):
+            acts.requires_grad = True
+            return acts
+
+        self.hook_embed.add_hook(enable_gradient, is_permanent=True)
+
+    def _configure_skip_connection(self, block, transcoder):
+        cached = {}
+
+        def cache_activations(acts, hook):
+            cached["acts"] = acts
+
+        def add_skip_connection(acts: torch.Tensor, hook: HookPoint, grad_hook: HookPoint):
+            # We add grad_hook because we need a way to hook into the gradients of the output
+            # of this function. If we put the backwards hook here at hook, the grads will be 0
+            # because we detached acts.
+            skip_input_activation = cached.pop("acts")
+            if transcoder.W_skip is not None:
+                skip = transcoder.compute_skip(skip_input_activation)
+            else:
+                skip = skip_input_activation * 0
+            return grad_hook(skip + (acts - skip).detach())
+
+        # add feature input hook
+        output_hook_parts = self.feature_input_hook.split(".")
+        subblock = block
+        for part in output_hook_parts:
+            subblock = getattr(subblock, part)
+        subblock.add_hook(cache_activations, is_permanent=True)
+
+        # add feature output hook and special grad hook
+        output_hook_parts = self.original_feature_output_hook.split(".")
+        subblock = block
+        for part in output_hook_parts:
+            subblock = getattr(subblock, part)
+        subblock.hook_out_grad = HookPoint()
+        subblock.add_hook(
+            partial(add_skip_connection, grad_hook=subblock.hook_out_grad),
+            is_permanent=True,
+        )
+
+    def _deduplicate_attention_buffers(self):
+        """
+        Share attention buffers across layers to save memory.
+
+        TransformerLens makes separate copies of the same masks and RoPE
+        embeddings for each layer - This just keeps one copy
+        of each and shares it across all layers.
+        """
+
+        attn_masks = {}
+
+        for block in self.blocks:
+            attn_masks[block.attn.attn_type] = block.attn.mask
+            attn_masks["rotary_sin"] = block.attn.rotary_sin
+            attn_masks["rotary_cos"] = block.attn.rotary_cos
+
+        for block in self.blocks:
+            block.attn.mask = attn_masks[block.attn.attn_type]
+            block.attn.rotary_sin = attn_masks["rotary_sin"]
+            block.attn.rotary_cos = attn_masks["rotary_cos"]
+
+    def _get_activation_caching_hooks(
+        self,
+        zero_bos: bool = False,
+        sparse: bool = False,
+        apply_activation_function: bool = True,
+    ) -> Tuple[List, List[Tuple[str, Callable]]]:
+        activation_matrix = [None] * self.cfg.n_layers
+
+        def cache_activations(acts, hook, layer, zero_bos):
+            transcoder_acts = (
+                self.transcoders[layer]
+                .encode(acts, apply_activation_function=apply_activation_function)
+                .detach()
+                .squeeze(0)
+            )
+            if zero_bos:
+                transcoder_acts[0] = 0
+            if sparse:
+                activation_matrix[layer] = transcoder_acts.to_sparse()
+            else:
+                activation_matrix[layer] = transcoder_acts
+
+        activation_hooks = [
+            (
+                f"blocks.{layer}.{self.feature_input_hook}",
+                partial(cache_activations, layer=layer, zero_bos=zero_bos),
+            )
+            for layer in range(self.cfg.n_layers)
+        ]
+        return activation_matrix, activation_hooks
+
+    def get_activations(
+        self,
+        inputs: Union[str, torch.Tensor],
+        sparse: bool = False,
+        zero_bos: bool = False,
+        apply_activation_function: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get the transcoder activations for a given prompt
+
+        Args:
+            inputs (Union[str, torch.Tensor]): The inputs you want to get activations over
+            sparse (bool, optional): Whether to return a sparse tensor of activations.
+                Useful if d_transcoder is large. Defaults to False.
+            zero_bos (bool, optional): Whether to zero out activations / errors at the 0th
+                position (<BOS>). Defaults to False.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: the model logits on the inputs and the
+                associated activation cache
+        """
+
+        activation_cache, activation_hooks = self._get_activation_caching_hooks(
+            sparse=sparse,
+            zero_bos=zero_bos,
+            apply_activation_function=apply_activation_function,
+        )
+        with torch.inference_mode(), self.hooks(activation_hooks):
+            logits = self(inputs)
+        activation_cache = torch.stack(activation_cache)
+        if sparse:
+            activation_cache = activation_cache.coalesce()
+        return logits, activation_cache
+
+    @contextmanager
+    def zero_softcap(self):
+        current_softcap = self.cfg.output_logits_soft_cap
+        try:
+            self.cfg.output_logits_soft_cap = 0.0
+            yield
+        finally:
+            self.cfg.output_logits_soft_cap = current_softcap
+
+    @torch.no_grad()
+    def setup_attribution(
+        self,
+        inputs: Union[str, torch.Tensor],
+        sparse: bool = False,
+        zero_bos: bool = True,
+    ):
+        """Precomputes the transcoder activations and error vectors, saving them and the
+        token embeddings.
+
+        Args:
+            inputs (str): the inputs to attribute - hard coded to be a single string (no
+                batching) for now
+            sparse (bool): whether to return activations as a sparse tensor or not
+            zero_bos (bool): whether to zero out the activations and error vectors at the
+                bos position
+        """
+
+        if isinstance(inputs, torch.Tensor):
+            tokens = inputs.squeeze(0)
+            assert tokens.ndim == 1, "Tokens must be a 1D tensor"
+        else:
+            assert isinstance(inputs, str), "Inputs must be a string"
+            tokenized = self.tokenizer(inputs, return_tensors="pt").input_ids.to(self.cfg.device)
+            tokens = tokenized.squeeze(0)
+
+        special_tokens = []
+        for special_token in self.tokenizer.special_tokens_map.values():
+            if isinstance(special_token, list):
+                special_tokens.extend(special_token)
+            else:
+                special_tokens.append(special_token)
+
+        special_token_ids = self.tokenizer.convert_tokens_to_ids(special_tokens)
+        zero_bos = (
+            zero_bos and tokens[0].cpu().item() in special_token_ids
+        )  # == self.tokenizer.bos_token_id
+
+        # cache activations and MLP in
+        activation_matrix, activation_hooks = self._get_activation_caching_hooks(
+            sparse=sparse, zero_bos=zero_bos
+        )
+        mlp_in_cache, mlp_in_caching_hooks, _ = self.get_caching_hooks(
+            lambda name: self.feature_input_hook in name
+        )
+
+        error_vectors = torch.zeros(
+            [self.cfg.n_layers, len(tokens), self.cfg.d_model],
+            device=self.cfg.device,
+            dtype=self.cfg.dtype,
+        )
+
+        fvu_values = torch.zeros(
+            [self.cfg.n_layers, len(tokens)],
+            device=self.cfg.device,
+            dtype=torch.float32,
+        )
+
+        # hook into MLP out to compute errors
+        def compute_error_hook(acts, hook, layer):
+            in_hook = f"blocks.{layer}.{self.feature_input_hook}"
+            reconstruction = self.transcoders[layer](mlp_in_cache[in_hook])
+            error = acts - reconstruction
+            error_vectors[layer] = error
+            total_variance = (acts - acts.mean(dim=-2, keepdim=True)).pow(2).sum(dim=-1)
+            fvu_values[layer] = error.pow(2).sum(dim=-1) / total_variance
+
+        error_hooks = [
+            (f"blocks.{layer}.{self.feature_output_hook}", partial(compute_error_hook, layer=layer))
+            for layer in range(self.cfg.n_layers)
+        ]
+
+        # note: activation_hooks must come before error_hooks
+        logits = self.run_with_hooks(
+            tokens, fwd_hooks=activation_hooks + mlp_in_caching_hooks + error_hooks
+        )
+
+        if zero_bos:
+            error_vectors[:, 0] = 0
+
+        activation_matrix = torch.stack(activation_matrix)
+        if sparse:
+            activation_matrix = activation_matrix.coalesce()
+
+        token_vectors = self.W_E[tokens].detach()  # (n_pos, d_model)
+        return logits, activation_matrix, error_vectors, token_vectors
+
+    def setup_intervention_with_freeze(
+        self, inputs: Union[str, torch.Tensor], direct_effects: bool = False
+    ) -> List[Tuple[str, Callable]]:
+        """Sets up an intervention with either frozen attention (default) or frozen
+        attention, LayerNorm, and MLPs, for direct effects
+
+        Args:
+            inputs (Union[str, torch.Tensor]): The inputs to intervene on
+            direct_effects (bool, optional): Whether to freeze not just attention, but also
+                LayerNorm and MLPs. Defaults to False.
+
+        Returns:
+            List[Tuple[str, Callable]]: The freeze hooks needed to run the desired intervention.
+        """
+
+        if direct_effects:
+            hookpoints_to_freeze = ["hook_pattern", "hook_scale", self.feature_output_hook]
+            if self.skip_transcoder:
+                hookpoints_to_freeze.append(self.feature_input_hook)
+        else:
+            hookpoints_to_freeze = ["hook_pattern"]
+
+        freeze_cache, cache_hooks, _ = self.get_caching_hooks(
+            names_filter=lambda name: any(hookpoint in name for hookpoint in hookpoints_to_freeze)
+        )
+        self.run_with_hooks(inputs, fwd_hooks=cache_hooks)
+
+        def freeze_hook(activations, hook):
+            cached_values = freeze_cache[hook.name]
+
+            # if we're doing open-ended generation, the position dimensions won't match
+            # so we'll just freeze the previous positions, and leave the new ones unfrozen
+            if "hook_pattern" in hook.name and activations.shape[2:] != cached_values.shape[2:]:
+                new_activations = activations.clone()
+                new_activations[:, :, : cached_values.shape[2], : cached_values.shape[3]] = (
+                    cached_values
+                )
+                return new_activations
+
+            elif (
+                "hook_scale" in hook.name or self.feature_output_hook in hook.name
+            ) and activations.shape[1] != cached_values.shape[1]:
+                new_activations = activations.clone()
+                new_activations[:, : cached_values.shape[1]] = cached_values
+                return new_activations
+
+            # if other positions don't match, that's no good
+            assert activations.shape == cached_values.shape, (
+                f"Activations shape {activations.shape} does not match cached values"
+                f" shape {cached_values.shape} at hook {hook.name}"
+            )
+            return cached_values
+
+        fwd_hooks = [
+            (hookpoint, freeze_hook)
+            for hookpoint in freeze_cache.keys()
+            if self.feature_input_hook not in hookpoint
+        ]
+
+        if not direct_effects:
+            return fwd_hooks
+
+        if self.skip_transcoder:
+            skip_diffs = {}
+
+            def diff_hook(activations, hook, layer: int):
+                # The MLP hook out freeze hook sets the value of the MLP to the value it
+                # had when run on the inputs normally. We subtract out the skip that
+                # corresponds to such a run, and add in the skip with direct effects.
+                frozen_skip = self.transcoders[layer].compute_skip(freeze_cache[hook.name])
+                normal_skip = self.transcoders[layer].compute_skip(activations)
+
+                skip_diffs[layer] = normal_skip - frozen_skip
+
+            def add_diff_hook(activations, hook, layer: int):
+                return activations + skip_diffs[layer]
+
+            fwd_hooks += [
+                (f"blocks.{layer}.{self.feature_input_hook}", partial(diff_hook, layer=layer))
+                for layer in range(self.cfg.n_layers)
+            ]
+            fwd_hooks += [
+                (f"blocks.{layer}.{self.feature_output_hook}", partial(add_diff_hook, layer=layer))
+                for layer in range(self.cfg.n_layers)
+            ]
+        return fwd_hooks
+
+    def _get_feature_intervention_hooks(
+        self,
+        inputs: Union[str, torch.Tensor],
+        interventions: List[
+            Tuple[int, Union[int, slice, torch.Tensor], int, Union[int, torch.Tensor]]
+        ],
+        direct_effects: bool = False,
+        freeze_attention: bool = True,
+        apply_activation_function: bool = True,
+    ):
+        """Given the input, and a dictionary of features to intervene on, performs the
+        intervention, allowing all effects to propagate (optionally allowing its effects to
+        propagate through transcoders)
+
+        Args:
+            input (_type_): the input prompt to intervene on
+            intervention_dict (List[Tuple[int, Union[int, slice, torch.Tensor]], int,
+                Union[int, torch.Tensor]]): A list of interventions to perform, formatted as
+                a list of (layer, position, feature_idx, value)
+            direct_effects (bool): whether to freeze all MLPs/transcoders / attn patterns /
+                layernorm denominators
+            apply_activation_function (bool): whether to apply the activation function when
+                recording the activations to be returned. This is useful to set to False for
+                testing purposes, as attribution predicts the change in pre-activation
+                feature values.
+        """
+
+        interventions_by_layer = defaultdict(list)
+        for layer, pos, feature_idx, value in interventions:
+            interventions_by_layer[layer].append((pos, feature_idx, value))
+
+        # This activation cache will fill up during our forward intervention pass
+        activation_cache, activation_hooks = self._get_activation_caching_hooks(
+            apply_activation_function=apply_activation_function
+        )
+
+        def intervention_hook(activations, hook, layer, layer_interventions):
+            transcoder_activations = activation_cache[layer]
+            if not apply_activation_function:
+                transcoder_activations = (
+                    self.transcoders[layer]
+                    .activation_function(transcoder_activations.unsqueeze(0))
+                    .squeeze(0)
+                )
+            transcoder_output = self.transcoders[layer].decode(transcoder_activations)
+            for pos, feature_idx, value in layer_interventions:
+                transcoder_activations[pos, feature_idx] = value
+            new_transcoder_output = self.transcoders[layer].decode(transcoder_activations)
+            steering_vector = new_transcoder_output - transcoder_output
+            return activations + steering_vector
+
+        intervention_hooks = [
+            (
+                f"blocks.{layer}.{self.feature_output_hook}",
+                partial(intervention_hook, layer=layer, layer_interventions=layer_interventions),
+            )
+            for layer, layer_interventions in interventions_by_layer.items()
+        ]
+
+        all_hooks = (
+            self.setup_intervention_with_freeze(inputs, direct_effects=direct_effects)
+            if freeze_attention or direct_effects
+            else []
+        )
+        all_hooks += activation_hooks + intervention_hooks
+
+        cached_logits = [None]  # Use a list so we can mutate it
+        def logit_cache_hook(activations, hook):
+            # we need to manually apply the softcap (if used by the model), as it comes post-hook
+            if self.cfg.output_logits_soft_cap > 0.0:
+                cached_logits[0] = self.cfg.output_logits_soft_cap * F.tanh(
+                        activations / self.cfg.output_logits_soft_cap)
+            else:
+                cached_logits[0] = activations.clone()
+        all_hooks.append(('unembed.hook_post', logit_cache_hook))
+
+        return all_hooks, cached_logits, activation_cache
+
+    @torch.no_grad
+    def feature_intervention(
+        self,
+        inputs: Union[str, torch.Tensor],
+        interventions: List[
+            Tuple[int, Union[int, slice, torch.Tensor], int, Union[int, torch.Tensor]]
+        ],
+        direct_effects: bool = False,
+        freeze_attention: bool = True,
+        apply_activation_function: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Given the input, and a dictionary of features to intervene on, performs the
+        intervention, and returns the logits and feature activations. If direct_effects is
+        True, attention patterns will be frozen, along with MLPs and LayerNorms. If it is
+        False, the effects of the intervention will propagate through transcoders /
+        LayerNorms
+
+        Args:
+            input (_type_): the input prompt to intervene on
+            interventions (List[Tuple[int, Union[int, slice, torch.Tensor]], int,
+                Union[int, torch.Tensor]]): A list of interventions to perform, formatted as
+                a list of (layer, position, feature_idx, value)
+            direct_effects (bool): whether to freeze all MLPs/transcoders / attn patterns /
+                layernorm denominators
+            apply_activation_function (bool): whether to apply the activation function when
+                recording the activations to be returned. This is useful to set to False for
+                testing purposes, as attribution predicts the change in pre-activation
+                feature values.
+        """
+
+        feature_intervention_hook_output = self._get_feature_intervention_hooks(
+            inputs,
+            interventions,
+            direct_effects=direct_effects,
+            freeze_attention=freeze_attention,
+            apply_activation_function=apply_activation_function,
+        )
+
+        hooks, _, activation_cache = feature_intervention_hook_output
+
+        with self.hooks(hooks):
+            logits = self(inputs)
+
+        activation_cache = torch.stack(activation_cache)
+
+        return logits, activation_cache
+
+
+
+---
+File: /demos/graph_visualization.py
+---
+
+#%%
+from collections import namedtuple
+from typing import List, Optional, Tuple, Dict
+import random
+import string
+import math
+import html
+
+import torch
+from IPython.display import SVG
+
+
+Feature = namedtuple('Feature', ['layer', 'pos', 'feature_idx'])
+
+class InterventionGraph:
+    prompt: str
+    ordered_nodes: List['Supernode']
+    nodes: Dict[str, 'Supernode']
+
+    def __init__(self, ordered_nodes: List['Supernode'], prompt: str):
+        self.ordered_nodes = ordered_nodes
+        self.prompt = prompt
+        self.nodes = {}
+
+    def initialize_node(self, node, activations):
+        self.nodes[node.name] = node
+        if node.features:
+            node.default_activations = torch.tensor([activations[feature] for feature in node.features])
+        else:
+            node.default_activations = None
+
+    def set_node_activation_fractions(self, current_activations):
+        for node in self.nodes.values():
+            if node.features:
+                current_node_activation = torch.tensor([current_activations[feature] for feature in node.features]) 
+                node.activation = (current_node_activation / node.default_activations).mean().item()
+            else:
+                node.activation = None
+            node.intervention = None
+            node.replacement_node = None
+
+class Supernode:
+    name: str
+    activation: float|None
+    default_activations: torch.Tensor|None
+    children: List['Supernode']
+    intervention: None
+    replacement_node: Optional['Supernode']
+
+    def __init__(self, name: str, features: List[Feature], children: List['Supernode'] = [], 
+                 intervention: Optional[str] = None, replacement_node: Optional['Supernode'] = None):
+        self.name = name
+        self.features = features
+        self.activation = None
+        self.default_activations = None
+        self.children = children
+        self.intervention = intervention
+        self.replacement_node = replacement_node
+
+    def __repr__(self):
+        return f"Node(name={self.name}, activation={self.activation}, children={self.children}, intervention={self.intervention}, replacement_node={self.replacement_node})"
+
+
+def calculate_node_positions(nodes: List[List['Supernode']]):
+    """Calculate positions for all nodes including replacements"""
+    container_width = 600
+    container_height = 250
+    node_width = 100
+    node_height = 35
+    
+    node_data = {}
+    
+    # First, position the base nodes from the layout
+    for row_index in range(len(nodes)):
+        row = nodes[row_index]
+        row_y = container_height - (row_index * (container_height / (len(nodes) + 0.5)))
+        
+        for col_index in range(len(row)):
+            node = row[col_index]
+            row_width = len(row) * node_width + (len(row) - 1) * 50
+            start_x = (container_width - row_width) / 2
+            node_x = start_x + col_index * (node_width + 50)
+            
+            node_data[node.name] = {
+                'x': node_x,
+                'y': row_y,
+                'node': node
+            }
+    
+    # Then, position replacement nodes directly above their original nodes
+    all_nodes = set()
+    for layer in nodes:
+        for node in layer:
+            all_nodes.add(node)
+            if node.replacement_node:
+                all_nodes.add(node.replacement_node)
+    
+    for node in all_nodes:
+        if node.replacement_node and node.replacement_node.name not in node_data:
+            original_pos = node_data.get(node.name)
+            if original_pos:
+                node_data[node.replacement_node.name] = {
+                    'x': original_pos['x'] + 30,
+                    'y': original_pos['y'] - 35,
+                    'node': node.replacement_node
+                }
+    
+    return node_data
+
+
+def get_node_center(node_data, node_name):
+    """Get center coordinates of a node"""
+    node = node_data.get(node_name)
+    if not node:
+        return {'x': 0, 'y': 0}
+    return {
+        'x': node['x'] + 50,  # Center of node (100px wide)
+        'y': node['y'] + 17.5  # Center of node (35px tall)
+    }
+
+
+def create_connection_svg(node_data, connections):
+    """Generate SVG elements for all connections"""
+    svg_parts = []
+    
+    for conn in connections:
+        from_center = get_node_center(node_data, conn['from'])
+        to_center = get_node_center(node_data, conn['to'])
+        
+        if from_center['x'] == 0 or to_center['x'] == 0:
+            continue  # Skip if node doesn't exist
+        
+        # Line color and width
+        if conn.get('replacement'):
+            stroke_color = "#D2691E"
+            stroke_width = "4"
+        else:
+            stroke_color = "#8B4513"
+            stroke_width = "3"
+        
+        # Create connection line
+        svg_parts.append(f'<line x1="{from_center["x"]}" y1="{from_center["y"]}" '
+                        f'x2="{to_center["x"]}" y2="{to_center["y"]}" '
+                        f'stroke="{stroke_color}" stroke-width="{stroke_width}"/>')
+        
+        # Create arrow at the end of the line
+        dx = to_center['x'] - from_center['x']
+        dy = to_center['y'] - from_center['y']
+        length = math.sqrt(dx * dx + dy * dy)
+        
+        if length > 0:
+            # Normalize direction vector
+            dx_norm = dx / length
+            dy_norm = dy / length
+            
+            # Arrow points
+            arrow_size = 8
+            arrow_tip_x = to_center['x']
+            arrow_tip_y = to_center['y']
+            
+            # Calculate arrow base points
+            base_x = arrow_tip_x - arrow_size * dx_norm
+            base_y = arrow_tip_y - arrow_size * dy_norm
+            
+            # Perpendicular vector for arrow width
+            perp_x = -dy_norm * (arrow_size / 2)
+            perp_y = dx_norm * (arrow_size / 2)
+            
+            left_x = base_x + perp_x
+            left_y = base_y + perp_y
+            right_x = base_x - perp_x
+            right_y = base_y - perp_y
+            
+            svg_parts.append(f'<polygon points="{arrow_tip_x},{arrow_tip_y} {left_x},{left_y} {right_x},{right_y}" '
+                           f'fill="{stroke_color}"/>')
+    
+    return '\n'.join(svg_parts)
+
+
+def create_nodes_svg(node_data):
+    """Generate SVG elements for all nodes"""
+    svg_parts = []
+    
+    # Collect all replacement nodes
+    replacement_nodes = set()
+    for data in node_data.values():
+        node = data['node']
+        if node.replacement_node:
+            replacement_nodes.add(node.replacement_node.name)
+    
+    for name, data in node_data.items():
+        node = data['node']
+        x = data['x']
+        y = data['y']
+        
+        # Determine node colors and styles
+        is_low_activation = node.activation is not None and node.activation <= 0.25
+        has_negative_intervention = node.intervention and '-' in node.intervention
+        is_replacement = name in replacement_nodes
+        
+        if is_low_activation or has_negative_intervention:
+            fill_color = "#f0f0f0"
+            text_color = "#bbb"
+            stroke_color = "#ddd"
+        elif is_replacement:
+            fill_color = "#FFF8DC"
+            text_color = "#333"
+            stroke_color = "#D2691E"
+        else:
+            fill_color = "#e8e8e8"
+            text_color = "#333"
+            stroke_color = "#999"
+        
+        # Node rectangle
+        svg_parts.append(f'<rect x="{x}" y="{y}" width="100" height="35" '
+                        f'fill="{fill_color}" stroke="{stroke_color}" stroke-width="2" rx="8"/>')
+        
+        # Node text
+        text_x = x + 50  # Center horizontally
+        text_y = y + 22  # Center vertically (approximate)
+        escaped_name = html.escape(name)
+        svg_parts.append(f'<text x="{text_x}" y="{text_y}" text-anchor="middle" '
+                        f'fill="{text_color}" font-family="Arial, sans-serif" font-size="12" font-weight="bold">{escaped_name}</text>')
+        
+        # Add activation label if exists
+        if node.activation is not None:
+            activation_pct = round(node.activation * 100)
+            label_x = x - 15
+            label_y = y - 5
+            
+            # Background for activation label
+            svg_parts.append(f'<rect x="{label_x}" y="{label_y}" width="30" height="16" '
+                           f'fill="white" stroke="#ccc" stroke-width="1" rx="4"/>')
+            
+            # Activation text
+            svg_parts.append(f'<text x="{label_x + 15}" y="{label_y + 12}" text-anchor="middle" '
+                           f'fill="#8B4513" font-family="Arial, sans-serif" font-size="10" font-weight="bold">{activation_pct}%</text>')
+        
+        # Add intervention if exists
+        if node.intervention:
+            intervention_x = x - 20
+            intervention_y = y - 5
+            
+            # Estimate text width for background
+            text_width = len(node.intervention) * 8 + 10
+            escaped_intervention = html.escape(node.intervention)
+            
+            # Background for intervention
+            svg_parts.append(f'<rect x="{intervention_x}" y="{intervention_y}" width="{text_width}" height="16" '
+                           f'fill="#D2691E" stroke="none" rx="12"/>')
+            
+            # Intervention text
+            svg_parts.append(f'<text x="{intervention_x + text_width/2}" y="{intervention_y + 12}" text-anchor="middle" '
+                           f'fill="white" font-family="Arial, sans-serif" font-size="10" font-weight="bold">{escaped_intervention}</text>')
+    
+    return '\n'.join(svg_parts)
+
+
+def build_connections_data(nodes: List[List['Supernode']]):
+    """Build connection data from node relationships"""
+    connections = []
+    
+    # Collect all unique nodes
+    all_nodes = set()
+    
+    def add_node_and_related(node):
+        all_nodes.add(node)
+        if node.replacement_node:
+            add_node_and_related(node.replacement_node)
+        for child in node.children:
+            add_node_and_related(child)
+    
+    for layer in nodes:
+        for node in layer:
+            add_node_and_related(node)
+    
+    # First, identify which nodes are replacement nodes
+    replacement_nodes = set()
+    for node in all_nodes:
+        if node.replacement_node:
+            replacement_nodes.add(node.replacement_node.name)
+    
+    # Add all connections from nodes to their children
+    for node in all_nodes:
+        for child in node.children:
+            # Skip connections where the 'from' node has a replacement and this isn't a replacement connection
+            if node.replacement_node:
+                continue  # Skip original connections when replacement exists
+            
+            # A connection is a replacement if the source node IS a replacement node
+            is_replacement = node.name in replacement_nodes
+            
+            connection = {
+                'from': node.name,
+                'to': child.name
+            }
+            if is_replacement:
+                connection['replacement'] = True
+            
+            connections.append(connection)
+    
+    return connections
+
+
+def wrap_text_for_svg(text, max_width=80):
+    """Simple text wrapping for SVG - split into lines that fit within max_width characters"""
+    if len(text) <= max_width:
+        return [text]
+    
+    words = text.split()
+    lines = []
+    current_line = ""
+    
+    for word in words:
+        if len(current_line + " " + word) <= max_width:
+            current_line = current_line + " " + word if current_line else word
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    
+    if current_line:
+        lines.append(current_line)
+    
+    return lines
+
+
+def create_graph_visualization(intervention_graph: InterventionGraph, top_outputs: List[Tuple[str, float]]):
+    """
+    Creates an SVG-based graph visualization that renders properly on GitHub and other platforms.
+    """
+    
+    nodes = intervention_graph.ordered_nodes
+    prompt = intervention_graph.prompt
+    
+    # Calculate all positions
+    node_data = calculate_node_positions(nodes)
+    
+    # Build connection data
+    connections = build_connections_data(nodes)
+    
+    # Generate SVG components
+    connections_svg = create_connection_svg(node_data, connections)
+    nodes_svg = create_nodes_svg(node_data)
+    
+    # Create output items as SVG text
+    output_y_start = 350
+    output_items_svg = []
+    current_x = 40  # Align with header instead of 20
+    
+    for i, (text, percentage) in enumerate(top_outputs):
+        if i >= 6:  # Limit to 6 items to fit nicely
+            break
+            
+        display_text = text if text else "(empty)"
+        escaped_display_text = html.escape(display_text)
+        percentage_text = f"{round(percentage * 100)}%"
+        
+        # Background rectangle for output item
+        item_width = len(display_text) * 8 + len(percentage_text) * 6 + 20
+        output_items_svg.append(f'<rect x="{current_x}" y="{output_y_start}" width="{item_width}" height="20" '
+                               f'fill="#e8e8e8" stroke="none" rx="6"/>')
+        
+        # Output text
+        output_items_svg.append(f'<text x="{current_x + 5}" y="{output_y_start + 14}" '
+                               f'fill="#333" font-family="Arial, sans-serif" font-size="11" font-weight="bold">'
+                               f'{escaped_display_text} <tspan fill="#555" font-size="10">{percentage_text}</tspan></text>')
+        
+        current_x += item_width + 10
+    
+    output_items_svg_str = '\n'.join(output_items_svg)
+    
+    # Escape the prompt text for XML and wrap it
+    escaped_prompt = html.escape(prompt)
+    prompt_lines = wrap_text_for_svg(escaped_prompt, max_width=80)
+    
+    # Create prompt text lines as SVG
+    prompt_text_svg = []
+    for i, line in enumerate(prompt_lines):
+        y_offset = 325 + (i * 15)  # 15px line spacing
+        prompt_text_svg.append(f'<text x="40" y="{y_offset}" fill="#333" font-family="Arial, sans-serif" font-size="12">{line}</text>')
+    
+    prompt_text_svg_str = '\n'.join(prompt_text_svg)
+    
+    # Create the complete SVG
+    svg_content = f'''<svg width="700" height="400" xmlns="http://www.w3.org/2000/svg">
+    <!-- Background -->
+    <rect width="700" height="400" fill="#f5f5f5"/>
+    <rect x="20" y="20" width="660" height="360" fill="white" stroke="none" rx="12"/>
+    
+    <!-- Title -->
+    <text x="40" y="45" fill="#666" font-family="Arial, sans-serif" font-size="14" font-weight="bold" 
+          text-transform="uppercase" letter-spacing="1px">Graph &amp; Interventions</text>
+    
+    <!-- Graph area (moved up significantly) -->
+    <g transform="translate(50, 0)">
+        {connections_svg}
+        {nodes_svg}
+    </g>
+    
+    <!-- Prompt section -->
+    <line x1="40" y1="290" x2="660" y2="290" stroke="#ddd" stroke-width="1"/>
+    <text x="40" y="310" fill="#666" font-family="Arial, sans-serif" font-size="12" font-weight="bold" 
+          text-transform="uppercase" letter-spacing="0.5px">Prompt</text>
+    
+    <!-- Prompt text (GitHub-compatible) -->
+    {prompt_text_svg_str}
+    
+    <!-- Top outputs section -->
+    <text x="40" y="350" fill="#666" font-family="Arial, sans-serif" font-size="10" font-weight="bold" 
+          text-transform="uppercase" letter-spacing="0.5px">Top Outputs</text>
+    
+    <!-- Output items -->
+    <g transform="translate(0, 5)">
+        {output_items_svg_str}
+    </g>
+</svg>'''
+    
+    return SVG(svg_content)
+
+#%%
+# if __name__ == '__main__':
+#     say_austin_node = Node('Say Austin', activation=0.18)
+#     texas_node = Node('Texas', activation=0.91, children=[say_austin_node])
+#     say_capital_node = Node('Say a capital', activation=None, intervention='-2x', children=[say_austin_node])
+#     dallas_node = Node('Dallas', activation=1.0, children=[texas_node])
+#     state_node = Node('State', activation=1.0, children=[say_capital_node, texas_node])
+#     capital_node = Node('capital', activation=1.0, children=[say_capital_node])
+
+#     old_nodes = [[capital_node, state_node, dallas_node],[say_capital_node, texas_node], [say_austin_node]]
+
+#     prompt = "Fact: the capital of the state containing Dallas is"
+#     top_outputs = [("Texas", 0.76), ("located", 0.04), ("", 0.04), ("Houston", 0.03), ("Austin", 0.01), ("a", 0.01)]
+
+#     create_graph_visualization(old_nodes, prompt, top_outputs)
+
+#     say_sacramento_node = Node('Say Sacramento', activation=None)
+#     say_austin_node = Node('Say Austin', activation=0.0, replacement_node=say_sacramento_node)
+#     california_node = Node('California', activation=None, children=[say_sacramento_node], intervention='+2x')
+#     texas_node = Node('Texas', activation=None, children=[say_austin_node], intervention='-2x', replacement_node=california_node)
+#     say_capital_node = Node('Say a capital', activation=0.91, children=[say_austin_node])
+#     dallas_node = Node('Dallas', activation=1.0, children=[texas_node])
+#     state_node = Node('State', activation=1.0, children=[say_capital_node, texas_node])
+#     capital_node = Node('capital', activation=1.0, children=[say_capital_node])
+
+#     prompt = "Fact: the capital of the state containing Dallas is"
+#     top_outputs = [("Sacramento", 0.97), ("", 0.007), ("not", 0.004), ("the", 0.003), ("⏎", 0.003), ("()", 0.002)]
+
+#     nodes = [[capital_node, state_node, dallas_node],[say_capital_node, texas_node], [say_austin_node]]
+
+#     create_graph_visualization(nodes, prompt, top_outputs)
+
+# # %%
+
+
+
+---
+File: /demos/utils.py
+---
+
+import html
+import json
+import urllib.parse
+from collections import namedtuple
+from typing import Dict, List, Tuple
+
+import torch 
+from IPython.display import HTML, display
+
+Feature = namedtuple("Feature", ["layer", "pos", "feature_idx"])
+
+def get_topk(logits:torch.Tensor, tokenizer, k:int=5):
+    probs = torch.softmax(logits.squeeze()[-1], dim=-1)
+    topk = torch.topk(probs, k)
+    return [(tokenizer.decode([topk.indices[i]]), topk.values[i].item()) for i in range(k)]
+
+# Now let's create a version that's more adaptive to dark/light mode
+def display_topk_token_predictions(sentence, original_logits, new_logits, tokenizer, k:int=5):
+    """
+    Version that tries to be more adaptive to both dark and light modes
+    using higher contrast elements and CSS variables where possible
+    """
+
+    original_tokens = get_topk(original_logits, tokenizer, k)
+    new_tokens = get_topk(new_logits, tokenizer, k)
+    
+    # This version uses a technique that will work better in dark mode
+    # by using a combination of background colors and border styling
+    html = f"""
+    <style>
+    .token-viz {{
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        margin-bottom: 10px;
+        max-width: 700px;
+    }}
+    .token-viz .header {{
+        font-weight: bold;
+        font-size: 14px;
+        margin-bottom: 3px;
+        padding: 4px 6px;
+        border-radius: 3px;
+        color: white;
+        display: inline-block;
+    }}
+    .token-viz .sentence {{
+        background-color: rgba(200, 200, 200, 0.2);
+        padding: 4px 6px;
+        border-radius: 3px;
+        border: 1px solid rgba(100, 100, 100, 0.5);
+        font-family: monospace;
+        margin-bottom: 8px;
+        font-weight: 500;
+        font-size: 14px;
+    }}
+    .token-viz table {{
+        width: 100%;
+        border-collapse: collapse;
+        margin-bottom: 8px;
+        font-size: 13px;
+        table-layout: fixed;
+    }}
+    .token-viz th {{
+        text-align: left;
+        padding: 4px 6px;
+        font-weight: bold;
+        border: 1px solid rgba(150, 150, 150, 0.5);
+        background-color: rgba(200, 200, 200, 0.3);
+    }}
+    .token-viz td {{
+        padding: 3px 6px;
+        border: 1px solid rgba(150, 150, 150, 0.5);
+        font-weight: 500;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }}
+    .token-viz .token-col {{
+        width: 20%;
+    }}
+    .token-viz .prob-col {{
+        width: 15%;
+    }}
+    .token-viz .dist-col {{
+        width: 65%;
+    }}
+    .token-viz .monospace {{
+        font-family: monospace;
+    }}
+    .token-viz .bar-container {{
+        display: flex;
+        align-items: center;
+    }}
+    .token-viz .bar {{
+        height: 12px;
+        min-width: 2px;
+    }}
+    .token-viz .bar-text {{
+        margin-left: 6px;
+        font-weight: 500;
+        font-size: 12px;
+    }}
+    .token-viz .even-row {{
+        background-color: rgba(240, 240, 240, 0.1);
+    }}
+    .token-viz .odd-row {{
+        background-color: rgba(255, 255, 255, 0.1);
+    }}
+    </style>
+    
+    <div class="token-viz">
+        <div class="header" style="background-color: #555555;">Input Sentence:</div>
+        <div class="sentence">{sentence}</div>
+        
+        <div>
+            <div class="header" style="background-color: #2471A3;">Original Top {k} Tokens</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="token-col">Token</th>
+                        <th class="prob-col" style="text-align: right;">Probability</th>
+                        <th class="dist-col">Distribution</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    
+    # Calculate max probability for scaling
+    max_prob = max(
+        max([prob for _, prob in original_tokens]),
+        max([prob for _, prob in new_tokens])
+    )
+    
+    # Add rows for original tokens
+    for i, (token, prob) in enumerate(original_tokens):
+        bar_width = int(prob / max_prob * 100)
+        row_class = "even-row" if i % 2 == 0 else "odd-row"
+        html += f"""
+                    <tr class="{row_class}">
+                        <td class="monospace token-col" title="{token}">{token}</td>
+                        <td class="prob-col" style="text-align: right;">{prob:.3f}</td>
+                        <td class="dist-col">
+                            <div class="bar-container">
+                                <div class="bar" style="background-color: #2471A3; width: {bar_width}%;"></div>
+                                <span class="bar-text">{prob*100:.1f}%</span>
+                            </div>
+                        </td>
+                    </tr>
+        """
+    
+    # Add new tokens table
+    html += f"""
+                </tbody>
+            </table>
+            
+            <div class="header" style="background-color: #27AE60;">New Top {k} Tokens</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th class="token-col">Token</th>
+                        <th class="prob-col" style="text-align: right;">Probability</th>
+                        <th class="dist-col">Distribution</th>
+                    </tr>
+                </thead>
+                <tbody>
+    """
+    
+    # Add rows for new tokens
+    for i, (token, prob) in enumerate(new_tokens):
+        bar_width = int(prob / max_prob * 100)
+        row_class = "even-row" if i % 2 == 0 else "odd-row"
+        html += f"""
+                    <tr class="{row_class}">
+                        <td class="monospace token-col" title="{token}">{token}</td>
+                        <td class="prob-col" style="text-align: right;">{prob:.3f}</td>
+                        <td class="dist-col">
+                            <div class="bar-container">
+                                <div class="bar" style="background-color: #27AE60; width: {bar_width}%;"></div>
+                                <span class="bar-text">{prob*100:.1f}%</span>
+                            </div>
+                        </td>
+                    </tr>
+        """
+    
+    html += """
+                </tbody>
+            </table>
+        </div>
+    </div>
+    """
+    
+    display(HTML(html))
+
+
+def display_generations_comparison(original_text, pre_intervention_gens, post_intervention_gens):
+    """
+    Display a comparison of pre-intervention and post-intervention generations
+    with the new/continuation text highlighted.
+    """
+    # Ensure the original text is properly escaped
+    escaped_original = html.escape(original_text)
+    
+    # Build the HTML with CSS for styling
+    html_content = """
+    <style>
+    .generations-viz {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        margin-bottom: 12px;
+        font-size: 13px;
+        max-width: 700px;
+    }
+    .generations-viz .section-header {
+        font-weight: bold;
+        font-size: 14px;
+        margin: 10px 0 5px 0;
+        padding: 4px 6px;
+        border-radius: 3px;
+        color: white;
+        display: block;
+    }
+    .generations-viz .pre-intervention-header {
+        background-color: #2471A3;
+    }
+    .generations-viz .post-intervention-header {
+        background-color: #27AE60;
+    }
+    .generations-viz .generation-container {
+        margin-bottom: 8px;
+        padding: 3px;
+        border-left: 3px solid rgba(100, 100, 100, 0.5);
+    }
+    .generations-viz .generation-text {
+        background-color: rgba(200, 200, 200, 0.2);
+        padding: 6px 8px;
+        border-radius: 3px;
+        border: 1px solid rgba(100, 100, 100, 0.5);
+        font-family: monospace;
+        font-weight: 500;
+        white-space: pre-wrap;
+        line-height: 1.2;
+        font-size: 13px;
+        overflow-x: auto;
+    }
+    .generations-viz .base-text {
+        color: rgba(100, 100, 100, 0.9);
+    }
+    .generations-viz .new-text {
+        background-color: rgba(255, 255, 0, 0.25);
+        font-weight: bold;
+        padding: 1px 0;
+        border-radius: 2px;
+    }
+    .generations-viz .pre-intervention-item {
+        border-left-color: #2471A3;
+    }
+    .generations-viz .post-intervention-item {
+        border-left-color: #27AE60;
+    }
+    .generations-viz .generation-number {
+        font-weight: bold;
+        margin-bottom: 3px;
+        color: rgba(70, 70, 70, 0.9);
+        font-size: 12px;
+    }
+    </style>
+    
+    <div class="generations-viz">
+    """
+    
+    # Add pre-intervention section
+    html_content += """
+    <div class="section-header pre-intervention-header">Pre-intervention generations:</div>
+    """
+    
+    # Add each pre-intervention generation
+    for i, gen_text in enumerate(pre_intervention_gens):
+        # Split the text to highlight the continuation
+        if gen_text.startswith(original_text):
+            base_part = html.escape(original_text)
+            new_part = html.escape(gen_text[len(original_text):])
+            formatted_text = f'<span class="base-text">{base_part}</span><span class="new-text">{new_part}</span>'
+        else:
+            formatted_text = html.escape(gen_text)
+        
+        html_content += f"""
+        <div class="generation-container pre-intervention-item">
+            <div class="generation-number">Generation {i+1}</div>
+            <div class="generation-text">{formatted_text}</div>
+        </div>
+        """
+    
+    # Add post-intervention section
+    html_content += """
+    <div class="section-header post-intervention-header">Post-intervention generations:</div>
+    """
+    
+    # Add each post-intervention generation
+    for i, gen_text in enumerate(post_intervention_gens):
+        # Split the text to highlight the continuation
+        if gen_text.startswith(original_text):
+            base_part = html.escape(original_text)
+            new_part = html.escape(gen_text[len(original_text):])
+            formatted_text = f'<span class="base-text">{base_part}</span><span class="new-text">{new_part}</span>'
+        else:
+            formatted_text = html.escape(gen_text)
+        
+        html_content += f"""
+        <div class="generation-container post-intervention-item">
+            <div class="generation-number">Generation {i+1}</div>
+            <div class="generation-text">{formatted_text}</div>
+        </div>
+        """
+    
+    html_content += """
+    </div>
+    """
+    
+    display(HTML(html_content))
+
+
+def decode_url_features(url: str) -> Tuple[Dict[str, List[Feature]], List[Feature]]:
+    """
+    Extract both supernode features and individual singleton features from URL.
+
+    Returns:
+        Tuple of (supernode_features, singleton_features)
+        - supernode_features: Dict mapping supernode names to lists of Features
+        - singleton_features: List of individual Feature objects
+    """
+    decoded = urllib.parse.unquote(url)
+
+    parsed_url = urllib.parse.urlparse(decoded)
+    query_params = urllib.parse.parse_qs(parsed_url.query)
+
+    # Extract supernodes
+    supernodes_json = query_params.get("supernodes", ["[]"])[0]
+    supernodes_data = json.loads(supernodes_json)
+
+    supernode_features = {}
+    name_counts = {}
+
+    for supernode in supernodes_data:
+        name = supernode[0]
+        node_ids = supernode[1:]
+
+        # Handle duplicate names by adding counter
+        if name in name_counts:
+            name_counts[name] += 1
+            unique_name = f"{name} ({name_counts[name]})"
+        else:
+            name_counts[name] = 1
+            unique_name = name
+
+        nodes = []
+        for node_id in node_ids:
+            layer, feature_idx, pos = map(int, node_id.split("_"))
+            nodes.append(Feature(layer, pos, feature_idx))
+
+        supernode_features[unique_name] = nodes
+
+    # Extract individual/singleton features from pinnedIds
+    pinned_ids_str = query_params.get("pinnedIds", [""])[0]
+    singleton_features = []
+
+    if pinned_ids_str:
+        pinned_ids = pinned_ids_str.split(",")
+        for pinned_id in pinned_ids:
+            # Handle both regular format (layer_feature_pos) and E_ format
+            if pinned_id.startswith("E_"):
+                # E_26865_9 format - embedding layer
+                parts = pinned_id[2:].split("_")  # Remove 'E_' prefix
+                if len(parts) == 2:
+                    feature_idx, pos = map(int, parts)
+                    # Use -1 to indicate embedding layer
+                    singleton_features.append(Feature(-1, pos, feature_idx))
+            else:
+                # Regular layer_feature_pos format
+                parts = pinned_id.split("_")
+                if len(parts) == 3:
+                    layer, feature_idx, pos = map(int, parts)
+                    singleton_features.append(Feature(layer, pos, feature_idx))
+
+    return supernode_features, singleton_features
+
+
+# Keep the old function for backward compatibility
+def extract_supernode_features(url: str) -> Dict[str, List[Feature]]:
+    """Legacy function - only extracts supernode features"""
+    supernode_features, _ = decode_url_features(url)
+    return supernode_features
+
+
+---
+File: /tests/test_attributions_gemma.py
+---
+
+from functools import partial
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import device
+from tqdm import tqdm
+from transformer_lens import HookedTransformerConfig
+
+from circuit_tracer.attribution import attribute
+from circuit_tracer.graph import Graph
+from circuit_tracer.replacement_model import ReplacementModel
+from circuit_tracer.transcoder import SingleLayerTranscoder
+from circuit_tracer.transcoder.activation_functions import JumpReLU
+
+
+def verify_token_and_error_edges(
+    model: ReplacementModel,
+    graph: Graph,
+    delete_bos: bool = False,
+    act_atol=1e-3,
+    act_rtol=1e-3,
+    logit_atol=1e-5,
+    logit_rtol=1e-3,
+):
+    s = graph.input_tokens
+    adjacency_matrix = graph.adjacency_matrix.cuda()
+    active_features = graph.active_features.cuda()
+    logit_tokens = graph.logit_tokens.cuda()
+    total_active_features = active_features.size(0)
+    pos_start = 1 if delete_bos else 0
+
+    _, _, error_vectors, token_vectors = model.setup_attribution(s)
+
+    logits, activation_cache = model.get_activations(s, apply_activation_function=False)
+    logits = logits.squeeze(0)
+
+    relevant_activations = activation_cache[
+        active_features[:, 0], active_features[:, 1], active_features[:, 2]
+    ]
+    relevant_logits = logits[-1, logit_tokens]
+    demeaned_relevant_logits = relevant_logits - logits[-1].mean()
+
+    freeze_hooks = model.setup_intervention_with_freeze(s, direct_effects=True)
+
+    def verify_intervention(expected_effects, intervention):
+        new_activation_cache, activation_hooks = model._get_activation_caching_hooks(
+            apply_activation_function=False
+        )
+
+        fwd_hooks = [*freeze_hooks, intervention, *activation_hooks]
+        new_logits = model.run_with_hooks(s, fwd_hooks=fwd_hooks)
+        new_logits = new_logits.squeeze(0)
+
+        new_activation_cache = torch.stack(new_activation_cache)
+        new_relevant_activations = new_activation_cache[
+            active_features[:, 0], active_features[:, 1], active_features[:, 2]
+        ]
+        new_relevant_logits = new_logits[-1, logit_tokens]
+        new_demeaned_relevant_logits = new_relevant_logits - new_logits[-1].mean()
+
+        expected_activation_difference = expected_effects[:total_active_features]
+        expected_logit_difference = expected_effects[-len(logit_tokens) :]
+
+        assert torch.allclose(
+            new_relevant_activations,
+            relevant_activations + expected_activation_difference,
+            atol=act_atol,
+            rtol=act_rtol,
+        )
+        assert torch.allclose(
+            new_demeaned_relevant_logits,
+            demeaned_relevant_logits + expected_logit_difference,
+            atol=logit_atol,
+            rtol=logit_rtol,
+        )
+
+    def hook_error_intervention(activations, hook, layer: int, pos: int):
+        steering_vector = torch.zeros_like(activations)
+        steering_vector[:, pos] += error_vectors[layer, pos]
+        return activations + steering_vector
+
+    for error_node_layer in range(error_vectors.size(0)):
+        for error_node_pos in range(pos_start, error_vectors.size(1)):
+            error_node_index = error_node_layer * error_vectors.size(1) + error_node_pos
+            expected_effects = adjacency_matrix[:, total_active_features + error_node_index]
+            intervention = (
+                f"blocks.{error_node_layer}.{model.feature_output_hook}",
+                partial(hook_error_intervention, layer=error_node_layer, pos=error_node_pos),
+            )
+            verify_intervention(expected_effects, intervention)
+
+    def hook_token_intervention(activations, hook, pos: int):
+        steering_vector = torch.zeros_like(activations)
+        steering_vector[:, pos] += token_vectors[pos]
+        return activations + steering_vector
+
+    total_error_nodes = error_vectors.size(0) * error_vectors.size(1)
+    for token_pos in range(pos_start, token_vectors.size(0)):
+        expected_effects = adjacency_matrix[
+            :, total_active_features + total_error_nodes + token_pos
+        ]
+        intervention = ("hook_embed", partial(hook_token_intervention, pos=token_pos))
+        verify_intervention(expected_effects, intervention)
+
+
+def verify_feature_edges(
+    model: ReplacementModel,
+    graph: Graph,
+    n_samples: int = 100,
+    act_atol=5e-4,
+    act_rtol=1e-5,
+    logit_atol=1e-5,
+    logit_rtol=1e-3,
+):
+    s = graph.input_tokens
+    adjacency_matrix = graph.adjacency_matrix.cuda()
+    active_features = graph.active_features.cuda()
+    logit_tokens = graph.logit_tokens.cuda()
+    total_active_features = active_features.size(0)
+
+    logits, activation_cache = model.get_activations(s, apply_activation_function=False)
+    logits = logits.squeeze(0)
+
+    relevant_activations = activation_cache[
+        active_features[:, 0], active_features[:, 1], active_features[:, 2]
+    ]
+    relevant_logits = logits[-1, logit_tokens]
+    demeaned_relevant_logits = relevant_logits - logits[-1].mean()
+
+    def verify_intervention(
+        expected_effects, layer: int, pos: int, feature_idx: int, new_activation
+    ):
+        new_logits, new_activation_cache = model.feature_intervention(
+            s,
+            [(layer, pos, feature_idx, new_activation)],
+            direct_effects=True,
+            apply_activation_function=False,
+        )
+        new_logits = new_logits.squeeze(0)
+
+        new_relevant_activations = new_activation_cache[
+            active_features[:, 0], active_features[:, 1], active_features[:, 2]
+        ]
+        new_relevant_logits = new_logits[-1, logit_tokens]
+        new_demeaned_relevant_logits = new_relevant_logits - new_logits[-1].mean()
+
+        expected_activation_difference = expected_effects[:total_active_features]
+        expected_logit_difference = expected_effects[-len(logit_tokens) :]
+
+        assert torch.allclose(
+            new_relevant_activations,
+            relevant_activations + expected_activation_difference,
+            atol=act_atol,
+            rtol=act_rtol,
+        )
+        assert torch.allclose(
+            new_demeaned_relevant_logits,
+            demeaned_relevant_logits + expected_logit_difference,
+            atol=logit_atol,
+            rtol=logit_rtol,
+        )
+
+    random_order = torch.randperm(active_features.size(0))
+    chosen_nodes = random_order[:n_samples]
+    for chosen_node in tqdm(chosen_nodes):
+        layer, pos, feature_idx = active_features[chosen_node]
+        old_activation = activation_cache[layer, pos, feature_idx]
+        new_activation = old_activation * 2
+        expected_effects = adjacency_matrix[:, chosen_node]
+        verify_intervention(expected_effects, layer, pos, feature_idx, new_activation)
+
+
+def load_dummy_gemma_model(cfg: HookedTransformerConfig):
+    transcoders = {
+        layer_idx: SingleLayerTranscoder(
+            cfg.d_model, cfg.d_model * 4, JumpReLU(0.0, 0.1), layer_idx
+        )
+        for layer_idx in range(cfg.n_layers)
+    }
+    for transcoder in transcoders.values():
+        for _, param in transcoder.named_parameters():
+            nn.init.uniform_(param, a=-1, b=1)
+
+    model = ReplacementModel.from_config(cfg, transcoders)
+    model.tokenizer.bos_token_id = None
+    for _, param in model.named_parameters():
+        nn.init.uniform_(param, a=-1, b=1)
+
+    for i in range(len(transcoders)):
+        nn.init.uniform_(model.transcoders[i].activation_function.threshold, a=0, b=1)
+
+    return model
+
+
+def verify_small_gemma_model(s: torch.Tensor):
+    gemma_small_cfg = {
+        "n_layers": 2,
+        "d_model": 8,
+        "n_ctx": 8192,
+        "d_head": 4,
+        "model_name": "gemma-2-2b",
+        "n_heads": 2,
+        "d_mlp": 16,
+        "act_fn": "gelu_pytorch_tanh",
+        "d_vocab": 16,
+        "eps": 1e-06,
+        "use_attn_result": False,
+        "use_attn_scale": True,
+        "attn_scale": np.float64(16.0),
+        "use_split_qkv_input": False,
+        "use_hook_mlp_in": False,
+        "use_attn_in": False,
+        "use_local_attn": True,
+        "ungroup_grouped_query_attention": False,
+        "original_architecture": "Gemma2ForCausalLM",
+        "from_checkpoint": False,
+        "checkpoint_index": None,
+        "checkpoint_label_type": None,
+        "checkpoint_value": None,
+        "tokenizer_name": "google/gemma-2-2b",
+        "window_size": 4096,
+        "attn_types": ["global", "local"],
+        "init_mode": "gpt2",
+        "normalization_type": "RMSPre",
+        "device": device(type="cuda"),
+        "n_devices": 1,
+        "attention_dir": "causal",
+        "attn_only": False,
+        "seed": None,
+        "initializer_range": 0.02,
+        "init_weights": False,
+        "scale_attn_by_inverse_layer_idx": False,
+        "positional_embedding_type": "rotary",
+        "final_rms": True,
+        "d_vocab_out": 16,
+        "parallel_attn_mlp": False,
+        "rotary_dim": 4,
+        "n_params": 2146959360,
+        "use_hook_tokens": False,
+        "gated_mlp": True,
+        "default_prepend_bos": True,
+        "dtype": torch.float32,
+        "tokenizer_prepends_bos": True,
+        "n_key_value_heads": 2,
+        "post_embedding_ln": False,
+        "rotary_base": 10000.0,
+        "trust_remote_code": False,
+        "rotary_adjacent_pairs": False,
+        "load_in_4bit": False,
+        "num_experts": None,
+        "experts_per_token": None,
+        "relative_attention_max_distance": None,
+        "relative_attention_num_buckets": None,
+        "decoder_start_token_id": None,
+        "tie_word_embeddings": False,
+        "use_normalization_before_and_after": True,
+        "attn_scores_soft_cap": 50.0,
+        "output_logits_soft_cap": 0.0,
+        "use_NTK_by_parts_rope": False,
+        "NTK_by_parts_low_freq_factor": 1.0,
+        "NTK_by_parts_high_freq_factor": 4.0,
+        "NTK_by_parts_factor": 8.0,
+    }
+    cfg = HookedTransformerConfig.from_dict(gemma_small_cfg)
+    model = load_dummy_gemma_model(cfg)
+    graph = attribute(s, model)
+
+    verify_token_and_error_edges(model, graph, delete_bos=False)
+    verify_feature_edges(model, graph)
+
+
+def verify_large_gemma_model(s: torch.Tensor):
+    gemma_large_cfg = {
+        "n_layers": 16,
+        "d_model": 64,
+        "n_ctx": 8192,
+        "d_head": 32,
+        "model_name": "gemma-2-2b",
+        "n_heads": 16,
+        "d_mlp": 128,
+        "act_fn": "gelu_pytorch_tanh",
+        "d_vocab": 128,
+        "eps": 1e-06,
+        "use_attn_result": False,
+        "use_attn_scale": True,
+        "attn_scale": np.float64(16.0),
+        "use_split_qkv_input": False,
+        "use_hook_mlp_in": False,
+        "use_attn_in": False,
+        "use_local_attn": True,
+        "ungroup_grouped_query_attention": False,
+        "original_architecture": "Gemma2ForCausalLM",
+        "from_checkpoint": False,
+        "checkpoint_index": None,
+        "checkpoint_label_type": None,
+        "checkpoint_value": None,
+        "tokenizer_name": "google/gemma-2-2b",
+        "window_size": 4096,
+        "attn_types": [
+            "global",
+            "local",
+            "global",
+            "local",
+            "global",
+            "local",
+            "global",
+            "local",
+            "global",
+            "local",
+            "global",
+            "local",
+            "global",
+            "local",
+            "global",
+            "local",
+        ],
+        "init_mode": "gpt2",
+        "normalization_type": "RMSPre",
+        "device": device(type="cuda"),
+        "n_devices": 1,
+        "attention_dir": "causal",
+        "attn_only": False,
+        "seed": None,
+        "initializer_range": 0.02,
+        "init_weights": False,
+        "scale_attn_by_inverse_layer_idx": False,
+        "positional_embedding_type": "rotary",
+        "final_rms": True,
+        "d_vocab_out": 128,
+        "parallel_attn_mlp": False,
+        "rotary_dim": 32,
+        "n_params": 2146959360,
+        "use_hook_tokens": False,
+        "gated_mlp": True,
+        "default_prepend_bos": True,
+        "dtype": torch.float32,
+        "tokenizer_prepends_bos": True,
+        "n_key_value_heads": 16,
+        "post_embedding_ln": False,
+        "rotary_base": 10000.0,
+        "trust_remote_code": False,
+        "rotary_adjacent_pairs": False,
+        "load_in_4bit": False,
+        "num_experts": None,
+        "experts_per_token": None,
+        "relative_attention_max_distance": None,
+        "relative_attention_num_buckets": None,
+        "decoder_start_token_id": None,
+        "tie_word_embeddings": False,
+        "use_normalization_before_and_after": True,
+        "attn_scores_soft_cap": 50.0,
+        "output_logits_soft_cap": 0.0,
+        "use_NTK_by_parts_rope": False,
+        "NTK_by_parts_low_freq_factor": 1.0,
+        "NTK_by_parts_high_freq_factor": 4.0,
+        "NTK_by_parts_factor": 8.0,
+    }
+    cfg = HookedTransformerConfig.from_dict(gemma_large_cfg)
+    model = load_dummy_gemma_model(cfg)
+    graph = attribute(s, model)
+
+    verify_token_and_error_edges(model, graph, delete_bos=False)
+    verify_feature_edges(model, graph)
+
+
+def verify_gemma_2_2b(s: str):
+    model = ReplacementModel.from_pretrained("google/gemma-2-2b", "gemma")
+    graph = attribute(s, model)
+
+    print("Changing logit softcap to 0, as the logits will otherwise be off.")
+    with model.zero_softcap():
+        verify_token_and_error_edges(model, graph, delete_bos=True)
+        verify_feature_edges(model, graph)
+
+
+def test_small_gemma_model():
+    s = torch.tensor([10, 3, 4, 3, 2, 5, 3, 8])
+    verify_small_gemma_model(s)
+
+
+def test_large_gemma_model():
+    s = torch.tensor([0, 113, 24, 53, 27])
+    verify_large_gemma_model(s)
+
+
+def test_gemma_2_2b():
+    s = "The National Digital Analytics Group (ND"
+    verify_gemma_2_2b(s)
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    test_small_gemma_model()
+    test_large_gemma_model()
+    test_gemma_2_2b()
+
+
+
+---
+File: /tests/test_attributions_llama.py
+---
+
+import os
+import sys
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch import device
+from transformer_lens import HookedTransformerConfig
+
+from circuit_tracer.attribution import attribute
+from circuit_tracer.replacement_model import ReplacementModel
+from circuit_tracer.transcoder import SingleLayerTranscoder
+from circuit_tracer.transcoder.activation_functions import TopK
+
+sys.path.append(os.path.dirname(__file__))
+from test_attributions_gemma import verify_feature_edges, verify_token_and_error_edges
+
+
+def load_dummy_llama_model(cfg: HookedTransformerConfig, k: int):
+    transcoders = {
+        layer_idx: SingleLayerTranscoder(
+            cfg.d_model, cfg.d_model * 4, TopK(k), layer_idx, skip_connection=True
+        )
+        for layer_idx in range(cfg.n_layers)
+    }
+    for transcoder in transcoders.values():
+        for _, param in transcoder.named_parameters():
+            nn.init.uniform_(param, a=-1, b=1)
+
+    model = ReplacementModel.from_config(cfg, transcoders)
+    model.tokenizer.bos_token_id = None
+    for _, param in model.named_parameters():
+        nn.init.uniform_(param, a=-1, b=1)
+
+    return model
+
+
+def verify_small_llama_model(s: torch.Tensor):
+    llama_small_cfg = {
+        "n_layers": 2,
+        "d_model": 8,
+        "n_ctx": 2048,
+        "d_head": 4,
+        "model_name": "Llama-3.2-1B",
+        "n_heads": 2,
+        "d_mlp": 16,
+        "act_fn": "silu",
+        "d_vocab": 16,
+        "eps": 1e-05,
+        "use_attn_result": False,
+        "use_attn_scale": True,
+        "attn_scale": np.float64(8.0),
+        "use_split_qkv_input": False,
+        "use_hook_mlp_in": False,
+        "use_attn_in": False,
+        "use_local_attn": False,
+        "ungroup_grouped_query_attention": False,
+        "original_architecture": "LlamaForCausalLM",
+        "from_checkpoint": False,
+        "checkpoint_index": None,
+        "checkpoint_label_type": None,
+        "checkpoint_value": None,
+        "tokenizer_name": "meta-llama/Llama-3.2-1B",
+        "window_size": None,
+        "attn_types": None,
+        "init_mode": "gpt2",
+        "normalization_type": "RMSPre",
+        "device": device(type="cuda"),
+        "n_devices": 1,
+        "attention_dir": "causal",
+        "attn_only": False,
+        "seed": None,
+        "initializer_range": np.float64(0.017677669529663688),
+        "init_weights": False,
+        "scale_attn_by_inverse_layer_idx": False,
+        "positional_embedding_type": "rotary",
+        "final_rms": True,
+        "d_vocab_out": 16,
+        "parallel_attn_mlp": False,
+        "rotary_dim": 4,
+        "n_params": 1073741824,
+        "use_hook_tokens": False,
+        "gated_mlp": True,
+        "default_prepend_bos": True,
+        "dtype": torch.float32,
+        "tokenizer_prepends_bos": True,
+        "n_key_value_heads": 2,
+        "post_embedding_ln": False,
+        "rotary_base": 500000.0,
+        "trust_remote_code": False,
+        "rotary_adjacent_pairs": False,
+        "load_in_4bit": False,
+        "num_experts": None,
+        "experts_per_token": None,
+        "relative_attention_max_distance": None,
+        "relative_attention_num_buckets": None,
+        "decoder_start_token_id": None,
+        "tie_word_embeddings": False,
+        "use_normalization_before_and_after": False,
+        "attn_scores_soft_cap": -1.0,
+        "output_logits_soft_cap": -1.0,
+        "use_NTK_by_parts_rope": True,
+        "NTK_by_parts_low_freq_factor": 1.0,
+        "NTK_by_parts_high_freq_factor": 4.0,
+        "NTK_by_parts_factor": 32.0,
+    }
+
+    cfg = HookedTransformerConfig.from_dict(llama_small_cfg)
+    k = 4
+    model = load_dummy_llama_model(cfg, k)
+    graph = attribute(s, model)
+
+    verify_token_and_error_edges(model, graph, delete_bos=False)
+    verify_feature_edges(model, graph)
+
+
+def verify_large_llama_model(s: torch.Tensor):
+    llama_large_cfg = {
+        "n_layers": 8,
+        "d_model": 128,
+        "n_ctx": 2048,
+        "d_head": 32,
+        "model_name": "Llama-3.2-1B",
+        "n_heads": 4,
+        "d_mlp": 512,
+        "act_fn": "silu",
+        "d_vocab": 128,
+        "eps": 1e-05,
+        "use_attn_result": False,
+        "use_attn_scale": True,
+        "attn_scale": np.float64(8.0),
+        "use_split_qkv_input": False,
+        "use_hook_mlp_in": False,
+        "use_attn_in": False,
+        "use_local_attn": False,
+        "ungroup_grouped_query_attention": False,
+        "original_architecture": "LlamaForCausalLM",
+        "from_checkpoint": False,
+        "checkpoint_index": None,
+        "checkpoint_label_type": None,
+        "checkpoint_value": None,
+        "tokenizer_name": "meta-llama/Llama-3.2-1B",
+        "window_size": None,
+        "attn_types": None,
+        "init_mode": "gpt2",
+        "normalization_type": "RMSPre",
+        "device": device(type="cuda"),
+        "n_devices": 1,
+        "attention_dir": "causal",
+        "attn_only": False,
+        "seed": None,
+        "initializer_range": np.float64(0.017677669529663688),
+        "init_weights": False,
+        "scale_attn_by_inverse_layer_idx": False,
+        "positional_embedding_type": "rotary",
+        "final_rms": True,
+        "d_vocab_out": 128,
+        "parallel_attn_mlp": False,
+        "rotary_dim": 32,
+        "n_params": 1073741824,
+        "use_hook_tokens": False,
+        "gated_mlp": True,
+        "default_prepend_bos": True,
+        "dtype": torch.float32,
+        "tokenizer_prepends_bos": True,
+        "n_key_value_heads": 4,
+        "post_embedding_ln": False,
+        "rotary_base": 500000.0,
+        "trust_remote_code": False,
+        "rotary_adjacent_pairs": False,
+        "load_in_4bit": False,
+        "num_experts": None,
+        "experts_per_token": None,
+        "relative_attention_max_distance": None,
+        "relative_attention_num_buckets": None,
+        "decoder_start_token_id": None,
+        "tie_word_embeddings": False,
+        "use_normalization_before_and_after": False,
+        "attn_scores_soft_cap": -1.0,
+        "output_logits_soft_cap": -1.0,
+        "use_NTK_by_parts_rope": True,
+        "NTK_by_parts_low_freq_factor": 1.0,
+        "NTK_by_parts_high_freq_factor": 4.0,
+        "NTK_by_parts_factor": 32.0,
+    }
+    cfg = HookedTransformerConfig.from_dict(llama_large_cfg)
+    k = 16
+    model = load_dummy_llama_model(cfg, k)
+    graph = attribute(s, model)
+
+    verify_token_and_error_edges(model, graph, delete_bos=False)
+    verify_feature_edges(model, graph)
+
+
+def verify_llama_3_2_1b(s: str):
+    model = ReplacementModel.from_pretrained("meta-llama/Llama-3.2-1B", "llama")
+    graph = attribute(s, model, batch_size=128)
+
+    verify_token_and_error_edges(model, graph, delete_bos=True)
+    verify_feature_edges(model, graph)
+
+
+def test_small_llama_model():
+    s = torch.tensor([10, 3, 4, 3, 2, 5, 3, 8])
+    verify_small_llama_model(s)
+
+
+def test_large_llama_model():
+    s = torch.tensor([0, 113, 24, 53, 27])
+    verify_large_llama_model(s)
+
+
+def test_llama_3_2_1b():
+    s = "The National Digital Analytics Group (ND"
+    verify_llama_3_2_1b(s)
+
+
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    test_small_llama_model()
+    test_large_llama_model()
+    test_llama_3_2_1b()
+
+
+
+---
+File: /tests/test_graph.py
+---
+
+import numpy as np
+import torch
+from torch import device
+from transformer_lens import HookedTransformerConfig
+
+from circuit_tracer.graph import Graph, compute_edge_influence, compute_node_influence
+
+
+def test_small_graph():
+    value = 10
+    edge_matrix = torch.zeros([12, 12])
+    for node in [1, 3, 6, 8]:
+        edge_matrix[11, node] = 1 / 4
+
+    for node in [0, 1, 6]:
+        edge_matrix[3, node] = 1 / 12
+
+    for node in [9, 10]:
+        edge_matrix[1, node] = 1 / 6
+
+    edge_matrix[0, 9] = 1 / 12
+
+    adjacency_matrix = (edge_matrix > 0).float() * value
+
+    # These get pruned during node pruning with a 0.8 threshold
+    pruned_adjacency_matrix = adjacency_matrix.clone()
+    pruned_adjacency_matrix[0, 9] = 0
+    pruned_adjacency_matrix[3, 0] = 0
+
+    post_pruning_edge_matrix = torch.zeros([12, 12])
+    for node in [1, 3, 6, 8]:
+        post_pruning_edge_matrix[11, node] = 1 / 4
+
+    for node in [1, 6]:
+        post_pruning_edge_matrix[3, node] = 1 / 8
+
+    for node in [9, 10]:
+        post_pruning_edge_matrix[1, node] = 3 / 16
+
+    # This is our dummy model config; it doesn't really matter besides n_layers
+    gemma_small_cfg = {
+        "n_layers": 2,
+        "d_model": 8,
+        "n_ctx": 8192,
+        "d_head": 4,
+        "model_name": "gemma-2-2b",
+        "n_heads": 2,
+        "d_mlp": 16,
+        "act_fn": "gelu_pytorch_tanh",
+        "d_vocab": 16,
+        "eps": 1e-06,
+        "use_attn_result": False,
+        "use_attn_scale": True,
+        "attn_scale": np.float64(16.0),
+        "use_split_qkv_input": False,
+        "use_hook_mlp_in": False,
+        "use_attn_in": False,
+        "use_local_attn": True,
+        "ungroup_grouped_query_attention": False,
+        "original_architecture": "Gemma2ForCausalLM",
+        "from_checkpoint": False,
+        "checkpoint_index": None,
+        "checkpoint_label_type": None,
+        "checkpoint_value": None,
+        "tokenizer_name": "google/gemma-2-2b",
+        "window_size": 4096,
+        "attn_types": ["global", "local"],
+        "init_mode": "gpt2",
+        "normalization_type": "RMSPre",
+        "device": device(type="cuda"),
+        "n_devices": 1,
+        "attention_dir": "causal",
+        "attn_only": False,
+        "seed": None,
+        "initializer_range": 0.02,
+        "init_weights": False,
+        "scale_attn_by_inverse_layer_idx": False,
+        "positional_embedding_type": "rotary",
+        "final_rms": True,
+        "d_vocab_out": 16,
+        "parallel_attn_mlp": False,
+        "rotary_dim": 4,
+        "n_params": 2146959360,
+        "use_hook_tokens": False,
+        "gated_mlp": True,
+        "default_prepend_bos": True,
+        "dtype": torch.float32,
+        "tokenizer_prepends_bos": True,
+        "n_key_value_heads": 2,
+        "post_embedding_ln": False,
+        "rotary_base": 10000.0,
+        "trust_remote_code": False,
+        "rotary_adjacent_pairs": False,
+        "load_in_4bit": False,
+        "num_experts": None,
+        "experts_per_token": None,
+        "relative_attention_max_distance": None,
+        "relative_attention_num_buckets": None,
+        "decoder_start_token_id": None,
+        "tie_word_embeddings": False,
+        "use_normalization_before_and_after": True,
+        "attn_scores_soft_cap": 50.0,
+        "output_logits_soft_cap": 0.0,
+        "use_NTK_by_parts_rope": False,
+        "NTK_by_parts_low_freq_factor": 1.0,
+        "NTK_by_parts_high_freq_factor": 4.0,
+        "NTK_by_parts_factor": 8.0,
+    }
+    cfg = HookedTransformerConfig.from_dict(gemma_small_cfg)
+    test_graph = Graph(
+        input_string="ab",
+        input_tokens=torch.tensor([0, 1]),
+        active_features=torch.tensor([1, 2, 3, 4, 5]),
+        adjacency_matrix=adjacency_matrix,
+        cfg=cfg,
+        logit_tokens=torch.tensor([0]),
+        logit_probabilities=torch.tensor([1.0]),
+        selected_features=torch.tensor([1, 2, 3, 4, 5]),
+        activation_values=torch.tensor([1, 2, 3, 4, 5]) * 2,
+    )
+    test_graph.cfg.n_layers = 2
+
+    logit_weights = torch.zeros(adjacency_matrix.size(0))
+    logit_weights[-1] = 1.0
+
+    node_influence_on_logits = compute_node_influence(test_graph.adjacency_matrix, logit_weights)
+    influence_tensor = torch.tensor(
+        [1 / 12, 1 / 3, 0, 1 / 4, 0, 0, 1 / 3, 0, 1 / 4, 1 / 4, 1 / 6, 0]
+    )
+    assert torch.allclose(node_influence_on_logits, influence_tensor)
+
+    edge_influence_on_logits = compute_edge_influence(pruned_adjacency_matrix, logit_weights)
+    assert torch.allclose(edge_influence_on_logits, post_pruning_edge_matrix)
+
+
+if __name__ == "__main__":
+    test_small_graph()
+
+
+
+---
+File: /tests/test_hf_utils.py
+---
+
+# file: circuit-tracer/utils/test_hf_utils.py
+
+import unittest
+from unittest import mock
+
+# Import the function and exceptions you need to test or mock
+from circuit_tracer.utils.hf_utils import download_hf_uris
+from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError, HfHubHTTPError
+
+# A dummy URI for all tests
+TEST_URI = "hf://test-org/test-repo/model.bin"
+
+
+class TestHfUtilsDownload(unittest.TestCase):
+    """Test suite for the download_hf_uris function."""
+
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_hub_download")
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_api.repo_info")
+    @mock.patch("circuit_tracer.utils.hf_utils.get_token", return_value=None)
+    def test_public_no_token(self, mock_get_token, mock_repo_info, mock_download):
+        """Tests a public repo download with no token."""
+        mock_repo_info.return_value = mock.MagicMock(private=False, gated=False)
+        mock_download.return_value = "/fake/path/model.bin"
+        result = download_hf_uris([TEST_URI])
+        self.assertEqual(result, {TEST_URI: "/fake/path/model.bin"})
+        mock_download.assert_called_once()
+
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_hub_download")
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_api.repo_info")
+    @mock.patch("circuit_tracer.utils.hf_utils.get_token", return_value="fake_token")
+    def test_public_with_token(self, mock_get_token, mock_repo_info, mock_download):
+        """Tests a public repo download with a token present."""
+        mock_repo_info.return_value = mock.MagicMock(private=False, gated=False)
+        mock_download.return_value = "/fake/path/model.bin"
+        result = download_hf_uris([TEST_URI])
+        self.assertEqual(result, {TEST_URI: "/fake/path/model.bin"})
+        mock_download.assert_called_once()
+
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_hub_download")
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_api.repo_info")
+    @mock.patch("circuit_tracer.utils.hf_utils.get_token", return_value="fake_token_with_access")
+    def test_gated_with_access(self, mock_get_token, mock_repo_info, mock_download):
+        """Tests a gated repo where the user has access."""
+        mock_repo_info.return_value = mock.MagicMock(private=False, gated=True)
+        mock_download.return_value = "/fake/path/model.bin"
+        result = download_hf_uris([TEST_URI])
+        self.assertEqual(result, {TEST_URI: "/fake/path/model.bin"})
+        mock_download.assert_called_once()
+
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_hub_download")
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_api.repo_info")
+    @mock.patch("circuit_tracer.utils.hf_utils.get_token", return_value="fake_token_no_access")
+    def test_gated_without_access(self, mock_get_token, mock_repo_info, mock_download):
+        """Tests a gated repo where the user lacks access.
+           The download is attempted and raises GatedRepoError.
+        """
+        # Setup: Pre-flight check passes, as repo_info just returns metadata.
+        mock_repo_info.return_value = mock.MagicMock(private=False, gated=True)
+        # Setup: The download itself will fail.
+        mock_download.side_effect = GatedRepoError("User has not accepted terms.")
+
+        # Execute & Assert: Check that the GatedRepoError is raised by the function.
+        with self.assertRaises(GatedRepoError):
+            download_hf_uris([TEST_URI])
+        
+        # Assert that the download was actually attempted.
+        mock_download.assert_called_once()
+
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_hub_download")
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_api.repo_info")
+    @mock.patch("circuit_tracer.utils.hf_utils.get_token", return_value=None)
+    def test_gated_no_token(self, mock_get_token, mock_repo_info, mock_download):
+        """Tests a gated repo when no token is available.
+        """
+        # Setup: Pre-flight check passes, as repo_info just returns metadata.
+        mock_repo_info.return_value = mock.MagicMock(private=False, gated=True)
+
+        with self.assertRaises(PermissionError):
+            download_hf_uris([TEST_URI])
+
+        # no need to attempt download as no token means no access to a gated repo
+        mock_download.assert_not_called()
+
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_hub_download")
+    @mock.patch("circuit_tracer.utils.hf_utils.hf_api.repo_info")
+    @mock.patch("circuit_tracer.utils.hf_utils.get_token", return_value="fake_token")
+    def test_private_no_access_or_non_existent(self, mock_get_token, mock_repo_info, mock_download):
+        """Tests a private repo the user can't see, or a repo that doesn't exist.
+           Pre-flight check fails and error is propagated
+        """
+        mock_repo_info.side_effect = RepositoryNotFoundError("Repo not found.")
+
+        with self.assertRaises(RepositoryNotFoundError):
+            download_hf_uris([TEST_URI])
+            
+        # download is not called, as the repo is not found
+        mock_download.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()
