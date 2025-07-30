@@ -1,0 +1,61 @@
+Internship Bi-weekly Report
+Computer Engineering Department
+No 1
+Name - Surname ......Chotpisit Adunsehawat...... Student ID.......6531313221.........
+Internship institution......Japan Advanced Institute of Science and Technology (JAIST) ..............
+
+Date	Hours	Description	Student Signature
+2025/06/02	8	Onboarding, Create JAIST account, Campus Tour	Chotpisit
+2025/06/03	8	Review NLP background	Chotpisit
+2025/06/04	8	Reading Group Seminar, Tutorial on accessing JAIST Supercomputer	Chotpisit
+2025/06/05	8	Joint Meeting about research topics (Spatial Benchmark and AI Safety)	Chotpisit
+2025/06/06	8	Read AI Safety papers (Unbiasing, Surveys, Guardrails)	Chotpisit
+2025/06/09	8	Read AI Safety papers (Jailbreaks, Adversarial)	Chotpisit
+2025/06/10	8	Read AI Safety papers (Alignment Faking, HCI)	Chotpisit
+2025/06/11	8	Reading Group Seminar, Read AI Safety papers (Deceptive LLM, Unfaithful Reasoning)	Chotpisit
+2025/06/12	8	Read AI Safety papers (Scalable Oversight, Monitoring)	Chotpisit
+2025/06/13	8	Read AI Safety papers (VLM Safety, Harmful Dataset)	Chotpisit
+
+Date	Hours	Description	Student Signature
+2025/06/16	8	Read AI Safety papers (Mechanistic Interpretability, Auditing)	Chotpisit
+2025/06/17	8	Read AI Safety papers (RLs on AI Alignment, Data Poisoning)	Chotpisit
+2025/06/18	8	Reading Group Seminar, Read AI Safety papers (Latent CoT, Faithfulness, Shortcut)	Chotpisit
+2025/06/19	8	Joint Meeting about Hidden CoT	Chotpisit
+2025/06/20	8	Read AI Safety papers (Process Reward Model, Cognitive Behaviors, Cross Layer Transcoder)	Chotpisit
+2025/06/23	8	Read AI Safety papers (Reward Hacking, Monosemanticity)	Chotpisit
+2025/06/24	8	Read AI Safety papers (Anthropic’s HHH AI, Sleeper Agent)	Chotpisit
+2025/06/25	8	Reading Group Seminar, Read AI Safety papers (Scheming, Unfaithful CoT)	Chotpisit
+2025/06/26	8	Reading AI Safety papers (SAD dataset, Steering Vectors)	Chotpisit
+2025/06/27	8	Evaluate CoT faithfulness from GSM, Thai Exam dataset	Chotpisit
+
+Date	Hours	Description	Student Signature
+2025/06/30	8	Test reasoning games with LLM (Pahee games, 20 questions, 	Chotpisit
+2025/07/01	8	Evaluate reasoning games CoT	Chotpisit
+2025/07/02	8	Reading Group Seminar, Read NLP and LLM Benchmark papers	Chotpisit
+2025/07/03	8	Test word randomization with LLM, Read papers (Stateless, Multi-turn)	Chotpisit
+2025/07/04	8	Evaluate CoT faithfulness	Chotpisit
+2025/07/07	8	Test complex reasoning tasks (Poem Writing, Math Logic)	Chotpisit
+2025/07/08	8	Test CoT from word and number randomization, Read more papers (CoT interpretability)	Chotpisit
+2025/07/09	8	Reading Group Seminar, Prepare CoT results	Chotpisit
+2025/07/10	8	Joint Meeting about Unfaithful CoT results and discuss future topics	Chotpisit
+2025/07/11	8	Test and read more on LLM randomness	Chotpisit
+
+Date	Hours	Description	Student Signature
+2025/07/14	8	Test cases for LLM word and number randomness	Chotpisit
+2025/07/15	8	Verify results with Benford and Zipf’s Law, Read papers (Decoder-only Architecture, Text Generation Algorithm)	Chotpisit
+2025/07/16	8	Reading Group Seminar, Test Zipf’s Law on CoTs from Anthropics’ Alignment Faking paper	Chotpisit
+2025/07/17	8	Research human psychology on randomness and Benford’s Law exceptions	Chotpisit
+2025/07/18	8	Joint meeting on randomness results and debiasing approaches, Read papers on Polysemanticity	Chotpisit
+2025/07/21	8	Use Neuronpedia’s Sparse Autoencoder for examining randomness, Prepare Reading Group presentation	Chotpisit
+2025/07/22	8	Prepare Reading Group presentation, Read papers on Circuit Tracings	Chotpisit
+2025/07/23	8	Prepare Reading Group presentation, Read papers on Cross-Layer Transcoder and Superposition in NLP	Chotpisit
+2025/07/24	8	Present Reading Group Seminar on “On the Biology of a Large Language Model” paper	Chotpisit
+2025/07/25	8	Use Neuronpedia’s Attribution Graph for examining randomness on numbers and words	Chotpisit
+			
+	
+Date	Hours	Description	Student Signature
+2025/07/28	8	Explore more Randomness cases using Neuronpedia’s Circuit Tracing	Chotpisit
+2025/07/29	8	Attempt Latent Clustering on Circuit Tracing model	Chotpisit
+2025/07/30	8	Reading Group Seminar, Joint Meeting on final report	Chotpisit
+2025/07/31	8		Chotpisit
+	
