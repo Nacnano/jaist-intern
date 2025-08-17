@@ -29,7 +29,7 @@ Date	Hours	Description	Student Signature
 2025/06/27	8	Evaluate CoT faithfulness from GSM, Thai Exam dataset	Chotpisit
 
 Date	Hours	Description	Student Signature
-2025/06/30	8	Test reasoning games with LLM (Pahee games, 20 questions, 	Chotpisit
+2025/06/30	8	Test reasoning games with LLM (Pahee games, 20 questions) 	Chotpisit
 2025/07/01	8	Evaluate reasoning games CoT	Chotpisit
 2025/07/02	8	Reading Group Seminar, Read NLP and LLM Benchmark papers	Chotpisit
 2025/07/03	8	Test word randomization with LLM, Read papers (Stateless, Multi-turn)	Chotpisit
